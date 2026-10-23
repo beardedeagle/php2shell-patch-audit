@@ -263,8 +263,7 @@ python3 php2shell-audit.py --log php-error.log --process-events events.jsonl --j
 
 Responses are capped at 256 KiB, logs at 64 MiB/one million lines (1 MiB per
 line), and displayed log observations at 100; counts continue beyond that display
-limit. Truncation/parse failures retain UNKNOWN. See [source-methods.md](source-methods.md)
-for the review of all eleven supplied reference repositories and what was adopted.
+limit. Truncation/parse failures retain UNKNOWN.
 
 The upstream baselines are 8.2.35, 8.3.36, 8.4.27, and 8.5.12. Only exact stable
 `major.minor.patch` versions in these branches are classified from build evidence.
@@ -297,7 +296,7 @@ and process/DLL discovery using the current Python interpreter as a synthetic
 fixture. These checks and key-authenticated Windows SSH transport passed on a
 live Windows host; loaded-image uncertainty and protected-process coverage errors
 remain explicit. Linux SSH/sudo policy and production PHP deployments remain
-untested. See the source-methods document for the current validation record.
+untested.
 
 This is a point-in-time patch audit, not an exploitation or compromise test.
 Package databases, system tools, kernel/procfs, and supplied inventory/evidence
