@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -92,7 +93,9 @@ def main():
         if sys.platform == "win32":
             for parent in (php.parent, root):
                 for library in parent.glob("php[0-9]*.dll"):
-                    paths[str(library)] = "mod_php"
+                    # CLI workers load the core DLL, not debugger or Apache DLLs.
+                    if re.fullmatch(r"php[0-9]+(?:ts)?\.dll", library.name, re.I):
+                        paths[str(library)] = "mod_php"
         config = {"schema": 1, "scope": "disposable real-PHP fixtures", "coverage_confirmed": True,
                   "runtimes": [{"label": path, "path": path, "kind": kind} for path, kind in paths.items()]}
         builds = {audit.hash_file(path)["sha256"]: args.version for path in paths}

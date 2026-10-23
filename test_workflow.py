@@ -24,6 +24,30 @@ class FindingTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "Run only inside disposable"):
             verify_php.main()
 
+    def test_windows_php_fixture_requires_core_dll_but_not_debugger_dll(self):
+        import verify_php
+        for core in ("php8.dll", "php8ts.dll"):
+            with self.subTest(core=core), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in ("php.exe", core, "php8phpdbg.dll", "php8apache2_4.dll"):
+                    (root / name).write_bytes(b"fixture")
+                with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}), \
+                        patch.object(verify_php.sys, "platform", "win32"), \
+                        patch.object(verify_php.sys, "argv", ["verify_php.py", "--php", str(root / "php.exe"),
+                                                             "--version", "8.3.36", "--source", "fixture"]), \
+                        patch.object(verify_php.subprocess, "run") as execute, \
+                        patch.object(verify_php.subprocess, "Popen") as start, \
+                        patch.object(verify_php.audit, "discover", side_effect=RuntimeError("inventory captured")) as discover:
+                    execute.return_value.stdout = "8.3.36"
+                    start.return_value.poll.return_value = None
+                    with self.assertRaisesRegex(RuntimeError, "inventory captured"):
+                        verify_php.main()
+                runtimes = discover.call_args.args[0]["runtimes"]
+                self.assertEqual(len(runtimes), 4)
+                self.assertEqual(sorted((Path(row["path"]).name, row["kind"]) for row in runtimes),
+                                 sorted([("php.exe", "php"), (core, "mod_php")] * 2))
+                self.assertEqual(len({row["path"] for row in runtimes}), 4)
+
     def test_real_file_inspection_keeps_permission_errors_distinct_from_missing_paths(self):
         path = str(Path(tempfile.gettempdir()) / "php-fixture")
         with patch.object(audit.os, "stat", side_effect=PermissionError("denied")):
