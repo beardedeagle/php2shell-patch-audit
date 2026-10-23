@@ -39,7 +39,7 @@ Custom installations can use inventory paths and build records tied to SHA-256 h
 | Arch Linux, Manjaro and compatible pacman-based derivatives | Linux process/mapping identity, package ownership, mtree SHA-256 and native `vercmp`. | Rules for Arch rolling `php` and `php-legacy`; other packages and derivatives, including Manjaro, need vendor or build evidence. |
 | Gentoo, NixOS, Slackware, other Linux, and custom/embedded builds | Linux process/mapping identity and explicit runtime inventory. | SHA-256-bound build evidence. No Portage, Nix or Slackware package adapter is implemented. |
 | Windows desktop and Windows Server installations with Python and Windows PowerShell | Native process/DLL discovery, file hashes and PE version-resource hints; Windows OpenSSH transport. | Installed-file verdicts require build evidence. Running-image status remains `UNKNOWN`, with separate `file_status`. See the Windows versions tested below. |
-| macOS on Apple Silicon or Intel, with readable native process information | Native executable/module discovery and mapped-file identity through libproc; Homebrew receipt and MacPorts registry ownership; local and SSH checks. | A trusted package archive with matching file bytes, or SHA-256-bound build evidence. Package ownership/version alone remains `UNKNOWN`. Intel and older macOS releases have not been tested. |
+| macOS on Apple Silicon or Intel, with readable native process information | Native executable/module discovery and mapped-file identity through libproc; Homebrew receipt and MacPorts registry ownership; local and SSH checks. | A trusted package archive with matching file bytes, or SHA-256-bound build evidence. Package ownership/version alone remains `UNKNOWN`. |
 | FreeBSD, OpenBSD, NetBSD and other compatible Python hosts | Explicit installed-file assessment, HTTP and log observations. | SHA-256-bound build evidence for listed files. No native BSD process collector or package adapter is implemented. |
 
 Linux containers and WSL use the backend for their guest distribution. Audit each
@@ -79,8 +79,9 @@ their parent distribution's thresholds. Missing vendor/build evidence remains
 ### Tested environments
 
 The original native checks used system executables or compiled fixtures as
-stand-ins for PHP. Real PHP 8.3.35 and 8.3.36 tests on 2026-10-23 used isolated
-Docker containers, without installing PHP on a workstation or publishing ports.
+stand-ins for PHP. Real PHP tests on 2026-10-23 used isolated Docker containers
+and disposable GitHub-hosted runners, without installing PHP on a workstation
+or publishing ports.
 
 | Environment | Tests run |
 | --- | --- |
@@ -93,15 +94,19 @@ Docker containers, without installing PHP on a workstation or publishing ports.
 | macOS 27.0.1, arm64 | Native PID enumeration, executable/module discovery, mapped-file identity and replacement detection. Temporary Homebrew receipt/archive and MacPorts registry/archive fixtures; no PHP installation or live MacPorts deployment tested. |
 | PHP 8.3.35 and 8.3.36, Debian Bookworm Docker Official Images, arm64 | Real PHP-FPM pools, Apache/mod_php, two CLI installations, affected/fixed verdicts, missing evidence/inventory, and stale workers after binary replacement. |
 | Alpine 3.24.2 container with `php83` 8.3.36-r0 | Real installed PHP checksum and the new Alpine vendor rule, using native APK version comparison. |
+| Windows Server 2025 hosted runner, official PHP 8.3.36 | Two CLI installations and their core DLLs discovered; installed-file evidence reports `PATCHED`, while running-image status remains `UNKNOWN`. |
+| macOS 15 hosted runners | Intel: regression suite and native executable/module fixtures. Apple Silicon: real Homebrew PHP 8.3.33 CLI workers report `AFFECTED`; file replacement detection passes. Protected processes remain inaccessible. |
 
-All 113 regressions passed on macOS/Python 3.14.7, Windows/Python 3.13.15, and
+Regression tests passed on macOS/Python 3.14.7, Windows/Python 3.13.15, and
 disposable Linux containers with Python 3.9 and 3.15 on 2026-10-23.
-The CI workflow covers Python 3.9 and 3.15 on Linux, Windows and Intel
-macOS, plus real PHP fixtures on Linux, Windows and Apple Silicon macOS hosted
-runners. Hosted CI jobs have not yet been executed for this change; their
-configuration does not establish platform acceptance.
-Other named derivatives, Windows Server releases, BSD hosts, WSL and Podman
-transport have not been tested on those systems. Intel/older macOS, live macOS SSH,
+All 114 current regressions passed locally on macOS and in
+[hosted CI](https://github.com/beardedeagle/php2shell-patch-audit/actions/runs/40028071871):
+Python 3.9 and 3.15 on Ubuntu 24.04, Windows Server 2025 and Intel macOS 15.
+All 12 CI jobs passed, including the native Windows/macOS verifiers, four real
+PHP-FPM/Apache container cases, and the Windows and Apple Silicon PHP fixtures.
+These fixture results do not establish complete host discovery or production coverage.
+Other named derivatives, other Windows Server releases, BSD hosts, WSL and Podman
+transport have not been tested on those systems. Other macOS releases, live macOS SSH,
 Linux SSH/sudo policy, production PHP workloads and fleet-wide deployment coverage
 are also untested. The macOS SSH command construction has a regression test.
 
