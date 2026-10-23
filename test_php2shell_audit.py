@@ -322,7 +322,9 @@ class PackageMetadataTests(unittest.TestCase):
 
     def test_rpm_epoch_release_and_digest(self):
         replies = [subprocess.CompletedProcess([], 0, "php-fpm\t1\t8.3.6\t2.el9\t8\n", ""),
-                   subprocess.CompletedProcess([], 0, "/usr/sbin/php-fpm\t" + "b"*64 + "\n", "")]
+                   subprocess.CompletedProcess([], 0, "/usr/sbin/php-fpm\t" + "b"*64 + "\n", ""),
+                   subprocess.CompletedProcess([], 0, "x86_64\tRed Hat, Inc.\n", ""),
+                   subprocess.CompletedProcess([], 0, "(none)", "")]
         with patch.object(audit, "system_tool", return_value="/usr/bin/rpm"), \
                 patch.object(audit, "command", side_effect=replies):
             package = audit.rpm_metadata("/usr/sbin/php-fpm")

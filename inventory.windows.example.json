@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "scope": "REPLACE: Windows PHP installation or process scope",
+  "coverage_confirmed": false,
+  "runtimes": [
+    {"label": "PHP FastCGI", "kind": "cgi", "path": "C:\\PHP\\php-cgi.exe"},
+    {"label": "PHP engine DLL", "kind": "mod_php", "path": "C:\\PHP\\php8.dll"}
+  ]
+}
