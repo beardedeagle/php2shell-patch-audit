@@ -424,10 +424,11 @@ class SupplementaryEvidenceTests(unittest.TestCase):
         self.assertEqual(result["exit_status"], 2)
 
     def test_trusted_binary_probe_is_explicit_and_only_a_hint(self):
+        binary = str(Path(tempfile.gettempdir()) / "trusted-php.exe")
         with patch.object(audit, "hash_file", return_value={"sha256": "a" * 64}), \
                 patch.object(audit, "command", return_value=subprocess.CompletedProcess([], 0, "PHP 8.3.36 (cli)", "")) as run:
-            result = audit.audit_probe("/trusted/php")
-        self.assertEqual(run.call_args.args[0], ["/trusted/php", "-n", "-v"])
+            result = audit.audit_probe(binary)
+        self.assertEqual(run.call_args.args[0], [binary, "-n", "-v"])
         self.assertEqual(result["version_hints"][0]["upstream_comparison"], "PATCHED")
         self.assertEqual(result["exit_status"], 2)
 

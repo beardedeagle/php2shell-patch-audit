@@ -196,7 +196,7 @@ class IdentityTests(unittest.TestCase):
 class DiscoveryTests(unittest.TestCase):
     def simulate(self, foreign=False, denied=False):
         def read_text(path, *args, **kwargs):
-            if str(path).endswith("/maps"):
+            if path.name == "maps":
                 if denied:
                     raise PermissionError()
                 return "1000-2000 r-xp 0 08:01 88 /usr/lib/libphp8.3.so\n"
@@ -205,6 +205,7 @@ class DiscoveryTests(unittest.TestCase):
                 patch.object(Path, "iterdir", return_value=iter([Path("/proc/101"), Path("/proc/102")])), \
                 patch.object(audit, "start_time", return_value="100"), \
                 patch.object(audit.os, "readlink", return_value="/usr/sbin/php-fpm8.3"), \
+                patch.object(audit.os, "makedev", return_value=2049, create=True), \
                 patch.object(Path, "read_text", read_text), \
                 patch.object(audit, "same_namespace", return_value=not foreign):
             return audit.discover(None)
@@ -294,7 +295,7 @@ class SshTests(unittest.TestCase):
             self.assertEqual(json.loads(captured.getvalue())["received"], INVENTORY)
             return subprocess.CompletedProcess(argv, 0, captured.getvalue(), "")
         stub = "def remote_main(payload):\n import json\n print(json.dumps({'received': payload['inventory']}))\n return 0\n"
-        with patch.object(audit.Path, "read_text", return_value=stub), \
+        with patch.object(audit.Path, "read_bytes", return_value=stub.encode()), \
                 patch.object(audit, "system_tool", return_value="/usr/bin/ssh"), \
                 patch.object(audit, "command", side_effect=fake_ssh):
             result = audit.audit_ssh("example.invalid", False, INVENTORY, EMPTY)

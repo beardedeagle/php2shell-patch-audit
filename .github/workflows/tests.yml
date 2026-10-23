@@ -1,0 +1,92 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15-intel]
+        python: ['3.9', '3.15']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -q
+      - if: runner.os == 'Windows' && matrix.python == '3.15'
+        run: python verify_windows.py
+      - if: runner.os == 'macOS' && matrix.python == '3.15'
+        run: python verify_macos.py
+
+  php-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [8.3.35-fpm, 8.3.35-apache, 8.3.36-fpm, 8.3.36-apache]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.15'
+      - run: python verify_php_containers.py --case '${{ matrix.case }}'
+
+  php-windows:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.15'
+      - name: Verify official PHP archive and test on the disposable runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'PHP fixtures require a disposable hosted runner' }
+          $zip = Join-Path $env:RUNNER_TEMP 'php.zip'
+          $root = Join-Path $env:RUNNER_TEMP 'php-fixture'
+          # Official releases.json checksum checked 2026-10-23.
+          $sha256 = '3c9242622c7402b47c38d2ec2ed779cef3a290fd6f2bde6c35f9c482699e7900'
+          Invoke-WebRequest 'https://windows.php.net/downloads/releases/php-8.3.36-nts-Win32-vs16-x64.zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $sha256) { throw 'PHP archive checksum mismatch' }
+          Expand-Archive $zip -DestinationPath $root
+          python verify_php.py --php "$root/php.exe" --version 8.3.36 --source "windows.php.net ZIP SHA256 $sha256"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  php-macos:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.15'
+      - name: Install PHP only on the disposable hosted runner
+        shell: bash
+        run: |
+          if [[ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then exit 1; fi
+          brew install php@8.3
+          php_root="$(brew --prefix php@8.3)"
+          php_version="$(python -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().name.split("_")[0])' "$php_root")"
+          python verify_php.py --php "$php_root/bin/php" --version "$php_version" --source "Homebrew CI installation php@8.3 $php_version"

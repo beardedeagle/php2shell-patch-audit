@@ -18,7 +18,7 @@ Windows PowerShell. Unix SSH/container targets default to `/usr/bin/python3`;
 
 ## Platform scope
 
-The tables below list expected platform compatibility, built-in fix versions,
+The tables below list expected platform compatibility, known fixed package versions,
 and test coverage.
 
 ### Potential platform coverage
@@ -35,8 +35,8 @@ Custom installations can use inventory paths and build records tied to SHA-256 h
 | Debian, Ubuntu; dpkg derivatives such as Linux Mint, Pop!_OS, Kali and Raspberry Pi OS | Linux process/mapping identity, dpkg ownership and file checksums, native revision comparison. | Built-in rules only for the combinations below; other releases/derivatives need their own vendor rules or build evidence. |
 | RHEL, Rocky Linux, AlmaLinux, CentOS/CentOS Stream, Fedora, Oracle Linux and Amazon Linux | Linux process/mapping identity, RPM ownership and file checksums, native revision comparison. | Selected RHEL rules below; other vendors/streams need explicit rules, scoped RPM updateinfo, or build evidence. |
 | SUSE Linux Enterprise and openSUSE | The same generic RPM inspection path. | Vendor rules, scoped RPM updateinfo, or build evidence; no built-in SUSE/openSUSE thresholds. |
-| Alpine and compatible APK-based Linux systems | Linux process/mapping identity, installed-file `Q1` SHA-1 checksums and native APK version comparison. | Vendor rules or build evidence; no built-in Alpine thresholds. Other APK checksum encodings remain unsupported. |
-| Arch Linux, Manjaro and compatible pacman-based derivatives | Linux process/mapping identity, package ownership, mtree SHA-256 and native `vercmp`. | Vendor rules or build evidence; no built-in Arch/Manjaro thresholds. |
+| Alpine and compatible APK-based Linux systems | Linux process/mapping identity, installed-file `Q1` SHA-1 checksums and native APK version comparison. | Rules for selected Alpine 3.23/3.24 packages below; other releases/derivatives need vendor or build evidence. Other APK checksum encodings remain unsupported. |
+| Arch Linux, Manjaro and compatible pacman-based derivatives | Linux process/mapping identity, package ownership, mtree SHA-256 and native `vercmp`. | Rules for Arch rolling `php` and `php-legacy`; other packages and derivatives, including Manjaro, need vendor or build evidence. |
 | Gentoo, NixOS, Slackware, other Linux, and custom/embedded builds | Linux process/mapping identity and explicit runtime inventory. | SHA-256-bound build evidence. No Portage, Nix or Slackware package adapter is implemented. |
 | Windows desktop and Windows Server installations with Python and Windows PowerShell | Native process/DLL discovery, file hashes and PE version-resource hints; Windows OpenSSH transport. | Installed-file verdicts require build evidence. Running-image status remains `UNKNOWN`, with separate `file_status`. See the Windows versions tested below. |
 | macOS on Apple Silicon or Intel, with readable native process information | Native executable/module discovery and mapped-file identity through libproc; Homebrew receipt and MacPorts registry ownership; local and SSH checks. | A trusted package archive with matching file bytes, or SHA-256-bound build evidence. Package ownership/version alone remains `UNKNOWN`. Intel and older macOS releases have not been tested. |
@@ -47,9 +47,10 @@ deployment namespace separately; a guest report does not cover its host or other
 guests. Docker/Podman transport has the prerequisites described below. HTTP checks
 can target any OS, but cannot verify the backend's patch status.
 
-### Built-in fix versions
+### Known fixed package versions
 
-The script includes vendor fix versions for these OS/PHP combinations. Rules apply
+These are comparison thresholds, not patches applied by the script. It includes
+vendor fix versions for these OS/PHP combinations. Rules apply
 to recognized PHP runtime packages. File identity, checksums and inventory
 requirements still apply.
 
@@ -66,6 +67,8 @@ requirements still apply.
 | Debian 13 | 8.4 |
 | RHEL 8.10 | Red Hat PHP 7.4 module stream |
 | RHEL 9.8 | Red Hat PHP 8.0, non-modular |
+| Alpine 3.23 and 3.24, including their point releases | PHP 8.3, 8.4 and 8.5: base, `-fpm`, `-cgi` and `-apache2` packages |
+| Arch rolling | `php` (8.5) and `php-legacy` (8.3); separate split packages require their own evidence |
 
 Full fixed-package revisions and evidence formats are documented under
 [Package and build evidence](#package-and-build-evidence). Older-release update
@@ -75,9 +78,9 @@ their parent distribution's thresholds. Missing vendor/build evidence remains
 
 ### Tested environments
 
-Linux and Windows tests on 2026-10-22 used system executables as stand-ins for PHP.
-The macOS native tests on 2026-10-23 used a compiled fixture executable and shared
-library. Vulnerable and patched PHP deployments were not tested.
+The original native checks used system executables or compiled fixtures as
+stand-ins for PHP. Real PHP 8.3.35 and 8.3.36 tests on 2026-10-23 used isolated
+Docker containers, without installing PHP on a workstation or publishing ports.
 
 | Environment | Tests run |
 | --- | --- |
@@ -88,9 +91,15 @@ library. Vulnerable and patched PHP deployments were not tested.
 | Windows build 26300, Python 3.13.15, Windows PowerShell 5.1 | Native file evidence, path casing, PE resources, process/DLL discovery, and key-authenticated Windows SSH. The report includes access errors and cannot verify loaded images. |
 | macOS controller | Controller execution and offline/loopback regressions; Docker transport to a temporary Debian container. |
 | macOS 27.0.1, arm64 | Native PID enumeration, executable/module discovery, mapped-file identity and replacement detection. Temporary Homebrew receipt/archive and MacPorts registry/archive fixtures; no PHP installation or live MacPorts deployment tested. |
+| PHP 8.3.35 and 8.3.36, Debian Bookworm Docker Official Images, arm64 | Real PHP-FPM pools, Apache/mod_php, two CLI installations, affected/fixed verdicts, missing evidence/inventory, and stale workers after binary replacement. |
+| Alpine 3.24.2 container with `php83` 8.3.36-r0 | Real installed PHP checksum and the new Alpine vendor rule, using native APK version comparison. |
 
-All 98 regression tests passed on 2026-10-23. The APK streaming change has unit
-tests; the Alpine container test was not rerun after that change.
+All 113 regressions passed on macOS/Python 3.14.7, Windows/Python 3.13.15, and
+disposable Linux containers with Python 3.9 and 3.15 on 2026-10-23.
+The CI workflow covers Python 3.9 and 3.15 on Linux, Windows and Intel
+macOS, plus real PHP fixtures on Linux, Windows and Apple Silicon macOS hosted
+runners. Hosted CI jobs have not yet been executed for this change; their
+configuration does not establish platform acceptance.
 Other named derivatives, Windows Server releases, BSD hosts, WSL and Podman
 transport have not been tested on those systems. Intel/older macOS, live macOS SSH,
 Linux SSH/sudo policy, production PHP workloads and fleet-wide deployment coverage
@@ -210,12 +219,58 @@ flag still requires investigation/restart and another audit before exit `0`.
 An old image whose hash no longer matches installed-package metadata is UNKNOWN
 unless a trusted build entry independently identifies that old image.
 
+### Findings and saved reports
+
+Runtime records and report-level coverage failures include a `diagnostics` list.
+Each entry has a stable `code`, the original `detail`, a `next_step`, and relevant
+update `guidance` links. The text report prints the same next steps. Existing
+`status`, `file_status`, `restart_needed`, `issues` and exit-code meanings are
+unchanged. Guidance is informational; no repair command is executed.
+
+Common codes distinguish `ACCESS_DENIED`, `FILE_MISSING`, `FILE_CHANGED`,
+`PROCESS_CHANGED`, `EVIDENCE_MISSING`, `EVIDENCE_MISMATCH`, `VENDOR_RULE_MISSING`,
+`VERSION_UNSUPPORTED`, `LOADED_IMAGE_UNVERIFIED`, `RESTART_REQUIRED`, and
+`AFFECTED`. Coverage codes distinguish an unconfirmed inventory, missing expected
+runtimes, unexpected runtimes, incomplete discovery, and no observed runtime.
+`TRANSPORT_FAILED` identifies remote setup/protocol errors; `OBSERVATION_ONLY`
+identifies methods that cannot establish patch status. Other inspection errors
+retain `INSPECTION_FAILED` and their original detail.
+
+Each JSON report includes `metadata`: UTC report time, tool version and script
+SHA-256, target platform/version/architecture, and SHA-256 fingerprints of parsed
+inventory and evidence JSON. Fingerprints use sorted keys and compact JSON, so
+formatting changes do not change them. Imported RPM advisory rows are included in
+the evidence fingerprint. Raw input documents are not copied into metadata.
+These hashes identify inputs; they do not authenticate their source.
+
+Successful SSH/container audits retain metadata generated on the target.
+`host_role` distinguishes `audit-target` from `controller`; failed transports and
+HTTP/log/probe observations describe the controller, not an inspected backend.
+An unavailable local script fingerprint is `null` and does not hide an affected
+runtime. Diagnostic and metadata fields are additive within schema 1.
+
 ## Inventory and coverage
 
 Copy `inventory.example.json` to `inventory.json`. Replace its example with the
 runtime paths from your deployment, service or container inventory.
 Set `coverage_confirmed` to `true` only after confirming that inventory covers the
 stated scope. The unedited example will return `UNKNOWN`.
+
+To start from discovered paths:
+
+```sh
+python3 php2shell-audit.py --draft-inventory > inventory.draft.json
+python3 php2shell-audit.py --ssh auditor@host --draft-inventory > remote.draft.json
+python3 php2shell-audit.py --container php-app --draft-inventory > container.draft.json
+```
+
+Draft export intentionally exits `2`. It prints inventory JSON directly, with
+`coverage_confirmed: false`, deduplicated runtime paths, discovery errors and
+target metadata. It assesses no patch status and writes no file itself.
+Review the scope and paths, add inactive, renamed and hidden deployments, and
+resolve discovery failures before confirming coverage. A draft is rejected as
+audit input until reviewed and explicitly confirmed. Use one target per export;
+draft mode cannot be combined with evidence, file assessment or observation modes.
 
 Each entry has `label`, `kind`, and the absolute path seen for the running
 executable or mapped PHP module. Supported kinds: `fpm`, `mod_php`, `cgi`, `lsphp`,
@@ -391,6 +446,31 @@ For a verified custom backport, the build entry may additionally specify
 with that hash contains both fixes. The script trusts this supplied record; it
 cannot infer a backport from the version number.
 
+### Alpine and Arch rules
+
+Rules verified on 2026-10-23 use the publishers' own records for both CVEs:
+
+| Vendor scope | Fixed package revisions | Source |
+| --- | --- | --- |
+| Alpine 3.23/3.24 community: `php83`, `php84`, `php85` and their `-fpm`, `-cgi`, `-apache2` subpackages | `8.3.36-r0`, `8.4.27-r0`, `8.5.12-r0`, respectively | Alpine [3.23 secdb](https://secdb.alpinelinux.org/v3.23/community.json) and [3.24 secdb](https://secdb.alpinelinux.org/v3.24/community.json) |
+| Arch rolling: `php` | `8.5.12-1` | [AVG-2909](https://security.archlinux.org/AVG-2909) |
+| Arch rolling: `php-legacy` | `8.3.36-1` | [AVG-2910](https://security.archlinux.org/AVG-2910) |
+
+Alpine's release branch covers its point releases; `edge`, other branches and
+other OS IDs do not match. Arch rules require OS ID `arch`, release `rolling`
+and the exact listed binary package name. Separate Arch packages such as
+`php-fpm` are not inferred from the `php` advisory. Manjaro and other derivatives
+need their own evidence. Package checksums and native version comparison still
+apply before any patched verdict.
+
+To review a rule, check the exact release/source package in Alpine's `secfixes`,
+or the exact package, `status`, `fixed` and `issues` in Arch's
+[AVG-2909 JSON](https://security.archlinux.org/AVG-2909.json) and
+[AVG-2910 JSON](https://security.archlinux.org/AVG-2910.json). Confirm that the fixed
+revision covers both CVE IDs. Update the rule, its boundary/scope tests and the
+verification date together. Built-in rule dates appear as `rule_verified_at` in
+artifact reports; a date records review, not an automatic freshness guarantee.
+
 ### Homebrew and MacPorts archives
 
 Add `package_archives` to the same evidence JSON. This Homebrew example is a
@@ -441,6 +521,14 @@ Homebrew relocation or code signing can change installed bytes relative to a
 bottle. Such files require a separate `builds` record for the installed artifact;
 the tool does not reverse relocation or assume a mismatch is safe. No archive is
 downloaded and no package manager, installation, update or restart is performed.
+
+Repeated checks of the same archive/member within one audit reuse its verified
+digest only while device, inode, size, modification time and change time still
+match. Open handles recheck the current pathname. Changed or replaced archives
+are reverified; cache entries never survive an audit invocation. Every process
+still receives its own runtime-identity checks and file hashing. A five-worker
+fixture reduced archive verification from five full reads to one, about 0.24 s
+to 0.05 s locally; this is not a general performance guarantee.
 
 ### RPM repository advisories
 
@@ -529,6 +617,33 @@ platforms are listed under [Tested environments](#tested-environments).
 `verify_macos.py` compiles a temporary executable and PHP-named shared library,
 checks native mapping/replacement behavior, and exercises synthetic package
 archives and receipts. It runs no PHP or package manager and cleans up its fixtures.
+
+### Real PHP tests
+
+```sh
+# Requires Docker. PHP and Python test dependencies stay inside disposable images.
+python3 verify_php_containers.py
+# Optional single case:
+python3 verify_php_containers.py --case 8.3.36-fpm
+```
+
+The runner pins Docker Official Image digests for affected/fixed PHP-FPM and
+Apache builds. It sends only the audit script and fixture verifier into the build
+context, mounts no host directories, publishes no ports, and disables networking
+while fixtures run. `SYS_PTRACE` is confined to the test container for procfs
+inspection. Tests use ordinary sleeping CLI workers and idle servers, with no
+exploit payloads. A fixed binary replaces a running copy to check that the old
+worker cannot inherit the installed file's verdict.
+
+Test containers and derived images are removed afterward; downloaded base images
+and Docker build cache may remain. These commands never install PHP on the host.
+`verify_php.py` refuses direct workstation/self-hosted CI use. Windows and macOS
+PHP installation steps exist only in the GitHub-hosted CI jobs and reject
+self-hosted runners. The Windows ZIP is checksum-pinned; the macOS job uses a
+Homebrew installation on its disposable runner. Windows running-image uncertainty
+remains part of the expected result.
+
+### Trust boundaries
 
 This is a point-in-time patch audit, not an exploitation or compromise test.
 Package databases, system tools, kernel/procfs, and supplied inventory/evidence

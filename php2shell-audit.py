@@ -14,6 +14,7 @@ import json
 import lzma
 import ntpath
 import os
+import platform
 import re
 import secrets
 import shlex
@@ -29,6 +30,7 @@ import xml.etree.ElementTree as ET
 import zlib
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -54,10 +56,58 @@ DEBIAN_FIXES = {("12", "php8.2"): "8.2.35-1~deb12u1",
                 ("13", "php8.4"): "8.4.27-1~deb13u1"}
 DEBIAN_SOURCES = ["https://security-tracker.debian.org/tracker/" + cve for cve in CVES]
 MANAGERS = {"dpkg", "rpm", "apk", "pacman"}
+# Both CVEs in Alpine's release-scoped community secdb, verified 2026-10-23.
+ALPINE_FIXES = {"php83": "8.3.36-r0", "php84": "8.4.27-r0", "php85": "8.5.12-r0"}
+# Exact Arch binary-package advisories, verified 2026-10-23.
+ARCH_FIXES = {"php": ("8.5.12-1", "AVG-2909"), "php-legacy": ("8.3.36-1", "AVG-2910")}
+TOOL_VERSION = "1.1.0"
+GUIDANCE = {
+    "ubuntu": "https://ubuntu.com/server/docs/how-to/software/package-management/",
+    "debian": "https://www.debian.org/doc/manuals/debian-handbook/sect.regular-upgrades.en.html",
+    "rhel": "https://access.redhat.com/solutions/10021",
+    "rocky": "https://docs.rockylinux.org/guides/package_management/dnf_package_manager/",
+    "almalinux": "https://wiki.almalinux.org/documentation/errata.html",
+    "alpine": "https://docs.alpinelinux.org/user-handbook/0.1a/Working/apk.html#_upgrading_packages",
+    "arch": "https://wiki.archlinux.org/title/System_maintenance",
+    "homebrew": "https://docs.brew.sh/FAQ#how-do-i-update-my-local-packages",
+    "macports": "https://guide.macports.org/#using.port.upgrade",
+    "win32": "https://www.php.net/manual/en/install.windows.manual.php",
+}
+NEXT_STEPS = {
+    "ACCESS_DENIED": "Obtain read access to the reported process/file and rerun the audit.",
+    "FILE_MISSING": "Check the inventory path and deployment; inspect inactive artifacts separately.",
+    "FILE_CHANGED": "Recheck the deployed artifact and restart affected workers as appropriate, then re-audit.",
+    "PROCESS_CHANGED": "Rerun after the worker stops exiting or changing during inspection.",
+    "EVIDENCE_MISSING": "Supply trusted SHA-256 build evidence or a matching verified package archive.",
+    "EVIDENCE_MISMATCH": "Investigate the file/evidence mismatch; obtain evidence for the actual artifact.",
+    "VENDOR_RULE_MISSING": "Supply a vendor rule for this exact release/package covering both CVEs.",
+    "VERSION_UNSUPPORTED": "Supply verified backport evidence for both CVEs or use a supported fixed build.",
+    "LOADED_IMAGE_UNVERIFIED": "Assess installed files with --files; that result cannot clear Windows running images.",
+    "RESTART_REQUIRED": "Restart or replace the affected deployment using its normal procedure, then re-audit.",
+    "AFFECTED": "Apply a vendor/build update fixing both CVEs, restart affected workers, and re-audit.",
+    "INVENTORY_UNCONFIRMED": "Review discovered and inactive deployments, then supply a confirmed inventory.",
+    "EXPECTED_RUNTIME_MISSING": "Check the expected service/namespace; assess inactive files separately.",
+    "UNEXPECTED_RUNTIME": "Identify the runtime and include it in the reviewed deployment inventory.",
+    "DISCOVERY_INCOMPLETE": "Resolve process access or namespace restrictions and rerun within the deployment.",
+    "NO_RUNTIME_FOUND": "Confirm the target namespace and inventory; use --files for inactive deployments.",
+    "TRANSPORT_FAILED": "Check SSH/container access, the target Python path, and the reported transport error.",
+    "OBSERVATION_ONLY": "Run a local or remote artifact audit with confirmed inventory and trusted evidence.",
+    "INSPECTION_FAILED": "Resolve the reported inspection error and rerun; do not clear this deployment.",
+}
 
 
 class AuditError(Exception):
-    pass
+    """Audit failure with a stable diagnostic code."""
+
+    def __init__(self, message, code="INSPECTION_FAILED"):
+        """Initialize an audit failure.
+
+        Args:
+            message (str): Human-readable failure detail.
+            code (str): Key in NEXT_STEPS identifying the unresolved condition.
+        """
+        super().__init__(message)
+        self.code = code
 
 
 def command(argv, timeout=15, data=None):
@@ -129,9 +179,107 @@ def load_json(path):
     return json.loads(data)
 
 
-def require(condition, message):
+def require(condition, message, code="INSPECTION_FAILED"):
+    """Enforce an audit precondition.
+
+    Args:
+        condition (bool): Whether the required invariant holds.
+        message (str): Failure detail.
+        code (str): Stable diagnostic code.
+
+    Raises:
+        AuditError: The condition is false.
+    """
     if not condition:
-        raise AuditError(message)
+        raise AuditError(message, code)
+
+
+def diagnostic(code, detail, distro=None, manager=None):
+    """Describe a finding without changing its patch verdict.
+
+    Args:
+        code (str): Stable NEXT_STEPS key.
+        detail (str): Finding detail; treated as data in text and JSON output.
+        distro (tuple[str, str] | None): Audited OS ID and release.
+        manager (str | None): Artifact package manager, when known.
+
+    Returns:
+        dict: Code, detail, next step and applicable update guidance URLs.
+    """
+    guide = GUIDANCE.get(manager) or GUIDANCE.get(distro[0] if distro else sys.platform)
+    return {"code": code, "detail": detail, "next_step": NEXT_STEPS[code],
+            "guidance": [guide] if guide else ["https://github.com/beardedeagle/php2shell-patch-audit#patching-guidance"]}
+
+
+def error_diagnostic(error, distro=None, manager=None):
+    """Convert an inspection error into an actionable diagnostic.
+
+    Args:
+        error (Exception): Inspection or validation error.
+        distro (tuple[str, str] | None): Audited OS ID and release.
+        manager (str | None): Package manager already identified for the artifact.
+
+    Returns:
+        dict: Diagnostic retaining the original error detail.
+    """
+    code = error.code if isinstance(error, AuditError) else "INSPECTION_FAILED"
+    if isinstance(error, PermissionError):
+        code = "ACCESS_DENIED"
+    elif isinstance(error, FileNotFoundError):
+        code = "FILE_MISSING"
+    return diagnostic(code, str(error), distro, manager)
+
+
+def explain_record(record, distro):
+    """Attach unresolved conditions and restart guidance to an artifact record.
+
+    Args:
+        record (dict): Artifact assessment, updated in place.
+        distro (tuple[str, str] | None): Audited OS ID and release.
+
+    Returns:
+        dict: The record with additive diagnostics; status remains unchanged.
+    """
+    findings = record.setdefault("diagnostics", [])
+    if not findings and record["status"] != "PATCHED":
+        code = "AFFECTED" if record["status"] == "AFFECTED" else (
+            "VERSION_UNSUPPORTED" if "php_version" in record else "INSPECTION_FAILED")
+        findings.append(diagnostic(code, record.get("detail", ""), distro, record.get("manager")))
+    if record.get("restart_needed"):
+        findings.append(diagnostic("RESTART_REQUIRED", "Running file was removed or replaced", distro, record.get("manager")))
+    return record
+
+
+def report_metadata(inventory=None, evidence=None):
+    """Record the audited host and fingerprints of the supplied JSON documents.
+
+    Args:
+        inventory (dict | None): Parsed inventory, including its scope assertion.
+        evidence (dict | None): Parsed evidence, including imported advisory rows.
+
+    Returns:
+        dict: UTC report time, tool identity, target OS/architecture and SHA-256
+        fingerprints of canonical JSON; raw inputs are not retained.
+    """
+    def fingerprint(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                         allow_nan=False).encode()).hexdigest() if value is not None else None
+    try:
+        distro = os_release()
+    except (OSError, AuditError):
+        distro = None
+    source_hash = globals().get("AUDIT_SOURCE_SHA256")
+    if source_hash is None and "__file__" in globals():
+        try:
+            source_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        except OSError:
+            source_hash = None
+    return {"timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "tool_version": TOOL_VERSION, "tool_sha256": source_hash,
+            "target": {"platform": sys.platform, "os_release": list(distro) if distro else None,
+                       "os_version": platform.mac_ver()[0] if sys.platform == "darwin" else platform.version(),
+                       "architecture": platform.machine()},
+            "inventory_sha256": fingerprint(inventory), "evidence_sha256": fingerprint(evidence)}
 
 
 def absolute_path(value):
@@ -152,7 +300,7 @@ def validate_config(inventory, evidence):
                 "Inventory must have schema=1")
         require(inventory.get("coverage_confirmed") is True and
                 isinstance(inventory.get("scope"), str) and inventory["scope"].strip(),
-                "Inventory needs scope and an explicit coverage_confirmed=true assertion")
+                "Inventory needs scope and an explicit coverage_confirmed=true assertion", "INVENTORY_UNCONFIRMED")
         require(isinstance(inventory.get("runtimes"), list) and inventory["runtimes"],
                 "Inventory must contain expected runtimes")
         keys = set()
@@ -631,20 +779,20 @@ def discover_macos(inventory):
 
 def hash_macos_runtime(runtime):
     api = MacOSProcesses()
-    require(api.identity(runtime.pid) == runtime.start, "Process exited or PID was reused")
+    require(api.identity(runtime.pid) == runtime.start, "Process exited or PID was reused", "PROCESS_CHANGED")
     require(runtime.inode > 0 and not runtime.deleted, "Running macOS file has no readable vnode identity")
     with open(runtime.live_path, "rb") as stream:
         before = os.fstat(stream.fileno())
         require((before.st_dev, before.st_ino) == (runtime.device, runtime.inode),
-                "macOS pathname no longer identifies the running mapping; restart and re-audit")
+                "macOS pathname no longer identifies the running mapping; restart and re-audit", "FILE_CHANGED")
         hashes, info = hash_stream(stream)
         mappings = api.mappings(runtime.pid)
         require(any((row["device"], row["inode"]) == (info.st_dev, info.st_ino) for row in mappings),
-                "macOS mapping changed during inspection")
-        require(api.identity(runtime.pid) == runtime.start, "Process exited or PID was reused")
+                "macOS mapping changed during inspection", "PROCESS_CHANGED")
+        require(api.identity(runtime.pid) == runtime.start, "Process exited or PID was reused", "PROCESS_CHANGED")
         after = os.fstat(stream.fileno())
         require((info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
-                (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "Running file changed during inspection")
+                (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "Running file changed during inspection", "FILE_CHANGED")
     try:
         current = os.stat(runtime.path)
         restart = (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
@@ -663,13 +811,25 @@ def hash_stream(stream):
             digest.update(block)
     after = os.fstat(stream.fileno())
     require((info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
-            (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "File changed while hashing")
+            (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "File changed while hashing", "FILE_CHANGED")
     return {name: digest.hexdigest() for name, digest in hashes.items()}, info
 
 
 def hash_file(path):
+    """Hash a stable installed file without executing it.
+
+    Args:
+        path (str): Absolute path on this host.
+
+    Returns:
+        dict[str, str]: File digests keyed by algorithm name.
+
+    Raises:
+        AuditError: The path is invalid, non-regular or changes while hashing.
+        OSError: The file is missing or cannot be inspected.
+    """
     require(absolute_path(path) and Path(path).is_absolute(), "File path must be absolute on this host")
-    require(Path(path).is_file(), "File is missing or is not a regular file: " + path)
+    require(stat.S_ISREG(os.stat(path).st_mode), "File is not a regular file: " + path)
     with open(path, "rb") as stream:
         hashes, info = hash_stream(stream)
         # Windows stat/fstat can disagree on ctime semantics; compare open handles.
@@ -677,30 +837,30 @@ def hash_file(path):
             current = os.fstat(current_stream.fileno())
         require((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
                 (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns),
-                "File pathname changed while hashing")
+                "File pathname changed while hashing", "FILE_CHANGED")
     return hashes
 
 
 def hash_runtime(runtime):
     if sys.platform == "darwin":
         return hash_macos_runtime(runtime)
-    require(start_time(runtime.pid) == runtime.start, "Process exited or PID was reused")
+    require(start_time(runtime.pid) == runtime.start, "Process exited or PID was reused", "PROCESS_CHANGED")
     with ExitStack() as stack:
         try:
             stream = stack.enter_context(open(runtime.live_path, "rb"))
-        except OSError:
+        except OSError as exc:
             # map_files may need extra capabilities. A pathname is acceptable only
             # when its device/inode proves it is the file in the inspected mapping.
             require(runtime.kind == "mod_php" and not runtime.deleted,
-                    "Cannot read the running file")
+                    "Cannot read the running file", error_diagnostic(exc)["code"])
             stream = stack.enter_context(open(runtime.path, "rb"))
         info = os.fstat(stream.fileno())
         require(stat.S_ISREG(info.st_mode), "Running image is not a regular file")
         if runtime.kind == "mod_php":
             require((info.st_dev, info.st_ino) == (runtime.device, runtime.inode),
-                    "Module pathname no longer identifies the running mapping")
+                    "Module pathname no longer identifies the running mapping", "FILE_CHANGED")
         hashes, info = hash_stream(stream)
-    require(start_time(runtime.pid) == runtime.start, "Process exited or PID was reused")
+    require(start_time(runtime.pid) == runtime.start, "Process exited or PID was reused", "PROCESS_CHANGED")
     if runtime.kind == "mod_php":
         mapped = False
         for line in Path(f"/proc/{runtime.pid}/maps").read_text().splitlines():
@@ -709,11 +869,11 @@ def hash_runtime(runtime):
                 device = os.makedev(*(int(part, 16) for part in fields[3].split(":")))
                 if (device, int(fields[4])) == (info.st_dev, info.st_ino):
                     mapped = True
-        require(mapped, "PHP module mapping changed during inspection")
+        require(mapped, "PHP module mapping changed during inspection", "PROCESS_CHANGED")
     else:
         current = os.stat(runtime.live_path)
         require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino),
-                "Process executable changed during inspection")
+                "Process executable changed during inspection", "PROCESS_CHANGED")
     restart = runtime.deleted
     try:
         disk = os.stat(runtime.path)
@@ -884,7 +1044,7 @@ def macos_package_metadata(path):
                                    "receipt": str(database), "archive_member": original.lstrip("/")})
         except sqlite3.Error as exc:
             raise AuditError("Cannot read MacPorts registry: " + str(exc)) from exc
-    require(len(owners) == 1, "No unique Homebrew/MacPorts owner; supply SHA-256 build evidence")
+    require(len(owners) == 1, "No unique Homebrew/MacPorts owner; supply SHA-256 build evidence", "EVIDENCE_MISSING")
     return owners[0]
 
 
@@ -910,19 +1070,42 @@ class PackageTarInfo(tarfile.TarInfo):
         return info
 
 
-def package_archive_digest(package, evidence):
+def package_archive_digest(package, evidence, cache=None):
+    """Verify one package member, reusing unchanged archives within an audit.
+
+    Args:
+        package (dict): Exact manager/package/version and archive member identity.
+        evidence (dict): Validated operator-supplied archive evidence.
+        cache (dict | None): Per-audit digest cache; never shared between audits.
+
+    Returns:
+        tuple[str, dict]: Member SHA-256 and the matching evidence entry.
+
+    Raises:
+        AuditError: Evidence, archive integrity or member identity is unresolved.
+        OSError: The archive cannot be read or rechecked.
+    """
     entries = [row for row in evidence.get("package_archives", [])
                if all(row[key] == package[key] for key in ("manager", "package", "version"))]
     require(len(entries) == 1,
-            "Package ownership/version found, but no file checksum; supply a trusted package archive or build hash")
+            "Package ownership/version found, but no file checksum; supply a trusted package archive or build hash", "EVIDENCE_MISSING")
     entry = entries[0]
+    key = (entry["path"], entry["sha256"], package["archive_member"])
     matches = []
     try:
         with ExitStack() as stack:
             stream = stack.enter_context(open(entry["path"], "rb"))
             require(os.fstat(stream.fileno()).st_size <= MAX_ARCHIVE, "Package archive exceeds 512 MiB")
+            identity = file_signature(os.fstat(stream.fileno()))
+            if cache is not None and key in cache and cache[key][0] == identity:
+                with open(entry["path"], "rb") as current:
+                    path_identity = file_signature(os.fstat(current.fileno()))
+                require(path_identity == identity and
+                        file_signature(os.fstat(stream.fileno())) == identity,
+                        "Package archive changed while reading", "FILE_CHANGED")
+                return cache[key][1], entry
             hashes, before = hash_stream(stream)
-            require(hashes["sha256"] == entry["sha256"], "Package archive SHA-256 mismatch")
+            require(hashes["sha256"] == entry["sha256"], "Package archive SHA-256 mismatch", "EVIDENCE_MISMATCH")
             stream.seek(0)
             magic = stream.read(6)
             stream.seek(0)
@@ -949,18 +1132,34 @@ def package_archive_digest(package, evidence):
                             digest.update(block)
                     matches.append(digest.hexdigest())
             after = os.fstat(stream.fileno())
-            require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
-                    (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "Package archive changed while reading")
+            with open(entry["path"], "rb") as current:
+                path_identity = file_signature(os.fstat(current.fileno()))
+            require(identity == file_signature(before) == file_signature(after) == path_identity,
+                    "Package archive changed while reading", "FILE_CHANGED")
     except (tarfile.TarError, EOFError, lzma.LZMAError, zlib.error) as exc:
         raise AuditError("Invalid package tar archive: " + str(exc)) from exc
     require(len(matches) == 1, "Package archive has no unique matching file")
+    if cache is not None:
+        cache[key] = (identity, matches[0])
     return matches[0], entry
+
+
+def file_signature(info):
+    """Return the file identity and change markers used for archive reuse.
+
+    Args:
+        info (os.stat_result): Metadata from an open handle or pathname.
+
+    Returns:
+        tuple[int, ...]: Device, inode, size, modification and change times.
+    """
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
 def package_metadata(path):
     if sys.platform == "darwin":
         return macos_package_metadata(path)
-    require(sys.platform.startswith("linux"), "Use SHA-256 build evidence for this platform")
+    require(sys.platform.startswith("linux"), "Use SHA-256 build evidence for this platform", "EVIDENCE_MISSING")
     if Path("/var/lib/dpkg/status").is_file():
         return dpkg_metadata(path)
     if Path("/lib/apk/db/installed").is_file():
@@ -969,10 +1168,23 @@ def package_metadata(path):
         return pacman_metadata(path)
     if any(Path(p).is_dir() for p in ("/var/lib/rpm", "/usr/lib/sysimage/rpm")):
         return rpm_metadata(path)
-    raise AuditError("No supported package database; use SHA-256 build evidence for this build")
+    raise AuditError("No supported package database; use SHA-256 build evidence for this build", "EVIDENCE_MISSING")
 
 
 def fixed_rule(package, distro, evidence):
+    """Select a fix threshold for the exact vendor/package scope.
+
+    Args:
+        package (dict): Installed package identity and metadata.
+        distro (tuple[str, str]): Target OS ID and release.
+        evidence (dict): Validated operator rules and imported advisories.
+
+    Returns:
+        dict: Fixed revision, source references and a built-in review date when known.
+
+    Raises:
+        AuditError: No applicable rule establishes fixes for both CVEs.
+    """
     for rule in evidence.get("vendor_fixes", []):
         if (rule["os_id"], rule["os_version"], rule["manager"], rule["package"]) == (
                 *distro, package["manager"], package["package"]):
@@ -984,21 +1196,31 @@ def fixed_rule(package, distro, evidence):
             names = {source + suffix for suffix in ("-fpm", "-cgi", "-cli", "-common")}
             names.add("libapache2-mod-" + source)
             if distro[1] == release and package["package"] in names:
-                return {"fixed_version": version, "sources": sources}
+                return {"fixed_version": version, "sources": sources, "verified_at": "2026-10-22"}
+    if distro[0] == "alpine" and package["manager"] == "apk":
+        release = re.fullmatch(r"(3\.(?:23|24))(?:\.[0-9]+)?", distro[1])
+        for name, version in ALPINE_FIXES.items():
+            if release and package["package"] in {name, name + "-fpm", name + "-cgi", name + "-apache2"}:
+                return {"fixed_version": version, "verified_at": "2026-10-23",
+                        "sources": ["https://secdb.alpinelinux.org/v" + release[1] + "/community.json"]}
+    if distro == ("arch", "rolling") and package["manager"] == "pacman" and package["package"] in ARCH_FIXES:
+        version, advisory = ARCH_FIXES[package["package"]]
+        return {"fixed_version": version, "verified_at": "2026-10-23",
+                "sources": ["https://security.archlinux.org/" + advisory]}
     if (distro[0] == "rhel" and package["manager"] == "rpm"
             and package.get("vendor") == "Red Hat, Inc."
             and package["package"] in {"php", "php-cli", "php-common", "php-fpm"}):
         if (distro[1] == "8.10" and (package.get("module") or "").startswith("php:7.4:")
                 and package["version"].startswith("0:7.4.")):
             return {"fixed_version": "0:7.4.33-8.module+el8.10.0+25117+30337cca",
-                    "sources": ["https://access.redhat.com/errata/RHSA-2026:87080"]}
+                    "sources": ["https://access.redhat.com/errata/RHSA-2026:87080"], "verified_at": "2026-10-22"}
         if distro[1] == "9.8" and package.get("module") == "" and package["version"].startswith("0:8.0."):
             return {"fixed_version": "0:8.0.30-8.el9_8.1",
-                    "sources": ["https://access.redhat.com/errata/RHSA-2026:87151"]}
+                    "sources": ["https://access.redhat.com/errata/RHSA-2026:87151"], "verified_at": "2026-10-22"}
     imported = updateinfo_rule(package, distro, evidence)
     if imported:
         return imported
-    raise AuditError("No vendor advisory rule for this OS/package; supply verified evidence")
+    raise AuditError("No vendor advisory rule for this OS/package; supply verified evidence", "VENDOR_RULE_MISSING")
 
 
 def package_status(package, fixed):
@@ -1027,16 +1249,29 @@ def package_status(package, fixed):
     return "AFFECTED" if result.stdout.strip() == "-1" else "PATCHED"
 
 
-def inspect_runtime(runtime, distro, evidence):
+def inspect_runtime(runtime, distro, evidence, archive_cache=None):
+    """Assess a discovered artifact while preserving running-image uncertainty.
+
+    Args:
+        runtime (Runtime): Discovered process or module identity.
+        distro (tuple[str, str] | None): Target OS ID and release.
+        evidence (dict): Validated vendor, build and archive evidence.
+        archive_cache (dict | None): Archive results shared only within this audit.
+
+    Returns:
+        dict: Status, restart flag, retained evidence and actionable diagnostics.
+        Inspection failures remain UNKNOWN instead of clearing the artifact.
+    """
     record = {"pid": runtime.pid, "kind": runtime.kind, "path": runtime.path,
               "status": "UNKNOWN", "restart_needed": runtime.deleted}
     try:
         if sys.platform == "win32":
-            record.update(inspect_file({"kind": runtime.kind, "path": runtime.path}, distro, evidence))
+            record.update(inspect_file({"kind": runtime.kind, "path": runtime.path}, distro, evidence, archive_cache))
             record.update(pid=runtime.pid, assessment_scope="observed-file")
             record["file_status"] = record["status"]
             record["status"] = "UNKNOWN"
             record["detail"] += "; Windows module paths do not prove loaded-image identity; file status is separate"
+            record["diagnostics"].append(diagnostic("LOADED_IMAGE_UNVERIFIED", record["detail"], distro))
             return record
         if sys.platform == "darwin" and runtime.inode:
             try:
@@ -1046,13 +1281,27 @@ def inspect_runtime(runtime, distro, evidence):
                 record["restart_needed"] = True
         hashes, restart = hash_runtime(runtime)
         record.update(sha256=hashes["sha256"], restart_needed=restart)
-        assess_file(record, hashes, distro, evidence)
+        assess_file(record, hashes, distro, evidence, archive_cache)
     except (AuditError, OSError, ValueError, IndexError, EOFError, zlib.error) as exc:
         record["detail"] = str(exc)
-    return record
+        record["diagnostics"] = [error_diagnostic(exc, distro, record.get("manager"))]
+    return explain_record(record, distro)
 
 
-def assess_file(record, hashes, distro, evidence):
+def assess_file(record, hashes, distro, evidence, archive_cache=None):
+    """Match verified file bytes to trusted build or package evidence.
+
+    Args:
+        record (dict): Artifact record to update in place.
+        hashes (dict[str, str]): Digests of the audited file.
+        distro (tuple[str, str] | None): Target OS ID and release.
+        evidence (dict): Validated operator evidence.
+        archive_cache (dict | None): Per-audit archive results.
+
+    Raises:
+        AuditError: Ownership, checksums or applicable fix evidence are unresolved.
+        OSError: Package metadata or an archive cannot be read.
+    """
     record["sha256"] = hashes["sha256"]
     build = next((row for row in evidence.get("builds", []) if row["sha256"] == hashes["sha256"]), None)
     if build:
@@ -1064,30 +1313,44 @@ def assess_file(record, hashes, distro, evidence):
     if package.get("manager") in ("homebrew", "macports"):
         record["manager"] = package["manager"]
         record["package_receipt"] = package["receipt"]
-        expected, entry = package_archive_digest(package, evidence)
+        expected, entry = package_archive_digest(package, evidence, archive_cache)
         require(hashes["sha256"] == expected,
-                "File differs from package archive; relocated/modified builds require separate SHA-256 build evidence")
+                "File differs from package archive; relocated/modified builds require separate SHA-256 build evidence", "EVIDENCE_MISMATCH")
         record.update(status="PATCHED" if entry.get("fixed_cves") else upstream_status(entry["php_version"]),
                       php_version=entry["php_version"], source=entry["source"],
                       detail="File SHA-256 matches a file in the trusted package archive")
         return
     require(hashes[package["algorithm"]] == package["digest"],
-            "File differs from installed package checksum; patch status unresolved")
+            "File differs from installed package checksum; patch status unresolved", "EVIDENCE_MISMATCH")
     record["manager"] = package["manager"]
     require(distro is not None, "Cannot determine OS release for vendor comparison")
     rule = fixed_rule(package, distro, evidence)
     record.update(status=package_status(package, rule["fixed_version"]),
                   fixed_version=rule["fixed_version"], sources=rule["sources"],
                   detail="File checksum matches installed package metadata")
+    if "verified_at" in rule:
+        record["rule_verified_at"] = rule["verified_at"]
 
 
-def inspect_file(item, distro, evidence):
+def inspect_file(item, distro, evidence, archive_cache=None):
+    """Assess an installed file without asserting running-process coverage.
+
+    Args:
+        item (dict): Inventory kind and absolute file path.
+        distro (tuple[str, str] | None): Target OS ID and release.
+        evidence (dict): Validated operator evidence.
+        archive_cache (dict | None): Per-audit archive results.
+
+    Returns:
+        dict: Installed-file verdict, evidence and unresolved-condition diagnostics.
+    """
     record = {"pid": 0, "kind": item["kind"], "path": item["path"], "status": "UNKNOWN",
               "restart_needed": False, "assessment_scope": "installed-file"}
     try:
-        assess_file(record, hash_file(item["path"]), distro, evidence)
+        assess_file(record, hash_file(item["path"]), distro, evidence, archive_cache)
     except (AuditError, OSError, ValueError, IndexError, EOFError, zlib.error) as exc:
         record["detail"] = str(exc)
+        record["diagnostics"] = [error_diagnostic(exc, distro, record.get("manager"))]
     if sys.platform == "win32" and record["status"] == "UNKNOWN":
         try:
             record["version_hint"] = powershell_json(r'''
@@ -1099,10 +1362,23 @@ $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path)
 ''', item["path"])
         except (AuditError, OSError, ValueError) as exc:
             record["detail"] += "; Windows version resource unavailable: " + str(exc)
-    return record
+    return explain_record(record, distro)
 
 
-def finish(records, issues, mode="local", scope=None):
+def finish(records, issues, mode="local", scope=None, diagnostics=None, metadata=None):
+    """Summarize assessments without changing the established exit-code rules.
+
+    Args:
+        records (list[dict]): Artifact assessments.
+        issues (list[str]): Coverage or inspection failures preventing clearance.
+        mode (str): Local audit or transport/observation method.
+        scope (str | None): Operator-supplied deployment scope.
+        diagnostics (list[dict] | None): Structured explanations of report issues.
+        metadata (dict | None): Target/input identity captured by the caller.
+
+    Returns:
+        dict: Schema-1 report with additive diagnostics and metadata.
+    """
     if any(row["status"] == "AFFECTED" for row in records):
         status = 1
     elif (not records or issues or any(row["status"] != "PATCHED" or row["restart_needed"]
@@ -1110,13 +1386,37 @@ def finish(records, issues, mode="local", scope=None):
         status = 2
     else:
         status = 0
+    if diagnostics is None:
+        code = "TRANSPORT_FAILED" if mode in ("ssh", "container") else (
+            "OBSERVATION_ONLY" if mode != "local" else "DISCOVERY_INCOMPLETE")
+        diagnostics = [diagnostic(code, issue) for issue in issues]
+    if not records and not diagnostics:
+        diagnostics = [diagnostic("NO_RUNTIME_FOUND", "No runtime artifacts were assessed")]
+    metadata = metadata if metadata is not None else report_metadata()
+    metadata["host_role"] = "audit-target" if mode == "local" else "controller"
     return {"schema": 1, "completed": True, "mode": mode, "scope": scope,
             "cves": list(CVES), "verdict": {0: "PATCHED", 1: "AFFECTED", 2: "UNKNOWN"}[status],
-            "exit_status": status, "runtimes": records, "issues": issues}
+            "exit_status": status, "runtimes": records, "issues": issues,
+            "diagnostics": diagnostics, "metadata": metadata}
 
 
 def audit_local(inventory, evidence, files=False):
+    """Audit this namespace, keeping archive reuse confined to this invocation.
+
+    Args:
+        inventory (dict | None): Confirmed expected runtimes, if supplied.
+        evidence (dict): Vendor, build and archive evidence.
+        files (bool): Assess installed inventory files instead of running workers.
+
+    Returns:
+        dict: Audit report with input fingerprints and coverage diagnostics.
+
+    Raises:
+        AuditError: Configuration or file-mode requirements are invalid.
+    """
     validate_config(inventory, evidence)
+    metadata = report_metadata(inventory, evidence)
+    archive_cache = {}
     key = os.path.realpath if sys.platform == "darwin" else path_key
     if inventory is not None:
         keys = {(row["kind"], key(row["path"])) for row in inventory["runtimes"]}
@@ -1127,29 +1427,60 @@ def audit_local(inventory, evidence, files=False):
             distro = os_release()
         except (OSError, AuditError):
             distro = None
-        result = finish([inspect_file(row, distro, evidence) for row in inventory["runtimes"]], [], scope=inventory["scope"])
+        result = finish([inspect_file(row, distro, evidence, archive_cache) for row in inventory["runtimes"]], [],
+                        scope=inventory["scope"], metadata=metadata)
         result["assessment_scope"] = "installed-files-only"
         result["limitations"] = ["Does not establish running-process patch status or deployment coverage beyond listed files"]
         return result
     try:
         runtimes, issues = discover(inventory)
     except (AuditError, OSError) as exc:
-        return finish([], [str(exc)])
+        return finish([], [str(exc)], diagnostics=[error_diagnostic(exc)], metadata=metadata)
+    diagnostics = [diagnostic("DISCOVERY_INCOMPLETE", issue) for issue in issues]
     if inventory is None:
         issues.append("No confirmed inventory: automatic discovery cannot prove deployment coverage")
+        diagnostics.append(diagnostic("INVENTORY_UNCONFIRMED", issues[-1]))
     else:
         expected = {(row["kind"], key(row["path"])): row["label"] for row in inventory["runtimes"]}
         found = {(r.kind, key(r.path)) for r in runtimes}
         for missing in expected.keys() - found:
             issues.append("Expected runtime not observed: " + expected[missing] + " (" + missing[1] + ")")
+            diagnostics.append(diagnostic("EXPECTED_RUNTIME_MISSING", issues[-1]))
         for extra in found - expected.keys():
             issues.append("Runtime missing from inventory: " + extra[0] + " " + extra[1])
+            diagnostics.append(diagnostic("UNEXPECTED_RUNTIME", issues[-1]))
     try:
         distro = os_release()
     except (OSError, AuditError):
         distro = None
-    records = [inspect_runtime(runtime, distro, evidence) for runtime in runtimes]
-    return finish(records, issues, scope=(inventory or {}).get("scope"))
+    records = [inspect_runtime(runtime, distro, evidence, archive_cache) for runtime in runtimes]
+    return finish(records, issues, scope=(inventory or {}).get("scope"), diagnostics=diagnostics, metadata=metadata)
+
+
+def draft_inventory():
+    """Discover candidate inventory paths without asserting deployment coverage.
+
+    Returns:
+        dict: UNKNOWN audit report containing an unconfirmed inventory draft.
+        Discovery errors are retained; inactive and hidden runtimes need review.
+    """
+    try:
+        runtimes, issues = discover(None)
+    except (AuditError, OSError) as exc:
+        runtimes, issues = [], [str(exc)]
+    key = os.path.realpath if sys.platform == "darwin" else path_key
+    paths = {(run.kind, key(run.path)): run.path for run in runtimes}
+    draft = {"schema": 1, "scope": "REVIEW deployment scope", "coverage_confirmed": False,
+             "runtimes": [{"label": kind + " " + path, "kind": kind, "path": path}
+                          for (kind, _), path in sorted(paths.items())],
+             "discovery_issues": issues,
+             "review_required": "Add inactive, renamed and hidden deployments; confirm scope and coverage before auditing."}
+    report = finish([], issues + ["Draft inventory requires operator review"],
+                    diagnostics=[diagnostic("INVENTORY_UNCONFIRMED", draft["review_required"])] +
+                    [diagnostic("DISCOVERY_INCOMPLETE", issue) for issue in issues])
+    draft["metadata"] = report["metadata"]
+    report["draft_inventory"] = draft
+    return report
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1271,15 +1602,26 @@ def audit_http(target, details=False, multipart=False):
 def remote_main(payload):
     try:
         require(sys.version_info >= (3, 9), "Python 3.9+ is required")
-        result = audit_local(payload["inventory"], payload["evidence"], payload.get("files", False))
+        result = draft_inventory() if payload.get("draft", False) else audit_local(
+            payload["inventory"], payload["evidence"], payload.get("files", False))
     except (AuditError, OSError, ValueError, TypeError, EOFError, zlib.error) as exc:
-        result = finish([], ["Remote audit failed: " + str(exc)])
+        result = finish([], ["Remote audit failed: " + str(exc)], diagnostics=[error_diagnostic(exc)])
     result["token"] = payload["token"]
     print(json.dumps(result))
     return result["exit_status"]
 
 
 def valid_remote_result(result, token, rc):
+    """Check a remote envelope before trusting its verdict or rendering findings.
+
+    Args:
+        result (object): Decoded remote JSON.
+        token (str): Expected per-run result token.
+        rc (int): Transport process exit status.
+
+    Returns:
+        bool: Whether identity, field types, verdict and exit status are consistent.
+    """
     if not isinstance(result, dict) or result.get("token") != token:
         return False
     if result.get("schema") != 1 or result.get("completed") is not True:
@@ -1289,29 +1631,86 @@ def valid_remote_result(result, token, rc):
     records, issues = result.get("runtimes"), result.get("issues")
     if not isinstance(records, list) or not isinstance(issues, list) or not all(isinstance(x, str) for x in issues):
         return False
+    if not valid_diagnostics(result.get("diagnostics", [])):
+        return False
+    metadata = result.get("metadata")
+    if (not isinstance(metadata, dict) or not isinstance(metadata.get("target"), dict)
+            or not isinstance(metadata.get("timestamp_utc"), str)
+            or not isinstance(metadata.get("tool_version"), str)
+            or not isinstance(metadata.get("tool_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", metadata["tool_sha256"])):
+        return False
     for row in records:
         if (not isinstance(row, dict) or row.get("status") not in ("PATCHED", "AFFECTED", "UNKNOWN")
                 or type(row.get("restart_needed")) is not bool or type(row.get("pid")) is not int
                 or not isinstance(row.get("kind"), str) or row["kind"] not in KINDS
-                or not isinstance(row.get("path"), str)):
+                or not isinstance(row.get("path"), str)
+                or not valid_diagnostics(row.get("diagnostics", []))):
             return False
     expected = finish(records, issues)
     return rc == result.get("exit_status") == expected["exit_status"] and result.get("verdict") == expected["verdict"]
 
 
-def remote_program(inventory, evidence, files=False):
+def valid_diagnostics(value):
+    """Validate remote findings before rendering their fields.
+
+    Args:
+        value (object): Untrusted decoded JSON diagnostics value.
+
+    Returns:
+        bool: Whether all entries have known codes and safely renderable fields.
+    """
+    return isinstance(value, list) and all(
+        isinstance(row, dict) and isinstance(row.get("code"), str) and row["code"] in NEXT_STEPS
+        and isinstance(row.get("detail"), str) and isinstance(row.get("next_step"), str)
+        and isinstance(row.get("guidance"), list)
+        and all(isinstance(url, str) and url.startswith("https://") for url in row["guidance"])
+        for row in value)
+
+
+def remote_program(inventory, evidence, files=False, draft=False):
+    """Serialize this script and configuration for an authenticated transport.
+
+    Args:
+        inventory (dict | None): Target inventory.
+        evidence (dict): Target evidence; archive paths remain target-local.
+        files (bool): Select installed-file assessment.
+        draft (bool): Discover an unconfirmed inventory instead of assessing files.
+
+    Returns:
+        tuple[str, str]: Per-run result token and Python source sent over stdin.
+
+    Raises:
+        OSError: This script cannot be read for transfer.
+    """
     token = secrets.token_hex(24)
-    payload = {"token": token, "inventory": inventory, "evidence": evidence, "files": files}
-    source = Path(__file__).read_text()
+    payload = {"token": token, "inventory": inventory, "evidence": evidence, "files": files, "draft": draft}
+    source_bytes = Path(__file__).read_bytes()
+    source = source_bytes.decode("utf-8")
     # repr embeds data as Python string literals; no target/config enters shell code.
-    program = "import json\nns={'__name__':'php2shell_remote'}\n"
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    program = "import json\nns={'__name__':'php2shell_remote','AUDIT_SOURCE_SHA256':" + repr(source_hash) + "}\n"
     program += "exec(compile(" + ascii(source) + ",'<audit>','exec'),ns)\n"
     program += "raise SystemExit(ns['remote_main'](json.loads(" + repr(json.dumps(payload)) + ")))\n"
     return token, program
 
 
-def run_remote(argv, mode, target, inventory, evidence, files=False):
-    token, program = remote_program(inventory, evidence, files)
+def run_remote(argv, mode, target, inventory, evidence, files=False, draft=False):
+    """Run and validate one remote audit or inventory export.
+
+    Args:
+        argv (list[str]): Trusted utility and validated transport arguments.
+        mode (str): SSH or container transport name.
+        target (str): Validated target identifier.
+        inventory (dict | None): Target inventory.
+        evidence (dict): Target evidence.
+        files (bool): Select installed-file assessment.
+        draft (bool): Request an unconfirmed inventory draft.
+
+    Returns:
+        dict: Validated target report, or an UNKNOWN transport-failure report.
+    """
+    token, program = remote_program(inventory, evidence, files, draft)
     run = None
     try:
         run = command(argv, timeout=120, data=program)
@@ -1320,6 +1719,11 @@ def run_remote(argv, mode, target, inventory, evidence, files=False):
         result.pop("token")
         require(result.get("assessment_scope") == ("installed-files-only" if files else None),
                 "Remote result has the wrong assessment scope")
+        if draft:
+            candidate = result.get("draft_inventory")
+            require(isinstance(candidate, dict) and candidate.get("coverage_confirmed") is False
+                    and isinstance(candidate.get("runtimes"), list) and result["exit_status"] == 2,
+                    "Remote inventory draft missing or incorrectly confirmed")
         result["mode"] = mode
         result["target"] = target
         return result
@@ -1331,7 +1735,7 @@ def run_remote(argv, mode, target, inventory, evidence, files=False):
         return result
 
 
-def audit_ssh(host, sudo, inventory, evidence, files=False, remote_os="linux", python=None):
+def audit_ssh(host, sudo, inventory, evidence, files=False, remote_os="linux", python=None, draft=False):
     require(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:\[\]-]*", host), "Invalid SSH destination")
     if remote_os == "windows":
         require(not sudo, "--sudo is not supported for Windows SSH")
@@ -1346,16 +1750,16 @@ def audit_ssh(host, sudo, inventory, evidence, files=False, remote_os="linux", p
         if sudo:
             remote = "/usr/bin/sudo -n -- " + remote
     return run_remote([system_tool("ssh"), "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                       "-o", "StrictHostKeyChecking=yes", "--", host, remote], "ssh", host, inventory, evidence, files)
+                       "-o", "StrictHostKeyChecking=yes", "--", host, remote], "ssh", host, inventory, evidence, files, draft)
 
 
-def audit_container(container, engine, inventory, evidence, files=False, python=None):
+def audit_container(container, engine, inventory, evidence, files=False, python=None, draft=False):
     require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", container), "Invalid container name or ID")
     require(engine in ("docker", "podman"), "Unsupported container engine")
     python = python or "/usr/bin/python3"
     require(absolute_path(python) and python.startswith("/"), "Container Python must be an absolute POSIX path")
     return run_remote([system_tool(engine), "exec", "-i", container, python, "-"],
-                      "container", container, inventory, evidence, files)
+                      "container", container, inventory, evidence, files, draft)
 
 
 def audit_probe(path):
@@ -1456,11 +1860,16 @@ def main(argv=None):
     parser.add_argument("--updateinfo", action="append", default=[], metavar="XML_OR_GZ", help="Trusted RPM repository updateinfo metadata")
     parser.add_argument("--updateinfo-os", metavar="ID:VERSION", help="Exact target OS/release covered by supplied updateinfo")
     parser.add_argument("--inventory", help="Explicit expected runtime inventory JSON")
+    parser.add_argument("--draft-inventory", action="store_true", help="Print an unconfirmed inventory JSON draft; exit 2 until reviewed")
     parser.add_argument("--evidence", help="Trusted vendor fixes, build hashes or package archives JSON")
     parser.add_argument("--json", action="store_true", help="Emit full machine-readable evidence")
     args = parser.parse_args(argv)
     try:
         require(sys.version_info >= (3, 9), "Python 3.9+ is required")
+        require(not args.draft_inventory or (len(args.ssh) + len(args.container) <= 1 and not any((
+            args.inventory, args.evidence, args.files, args.http, args.http_details, args.multipart_check,
+            args.targets_file, args.probe_php, args.log, args.process_events, args.updateinfo))),
+            "--draft-inventory requires discovery only, for one local host or one SSH/container target")
         require(not args.sudo or args.ssh, "--sudo requires --ssh")
         require(not args.inventory or len(args.ssh) + len(args.container) <= 1,
                 "Use one remote host/container per invocation with its own inventory")
@@ -1496,9 +1905,9 @@ def main(argv=None):
             try:
                 if mode == "ssh":
                     reports.append(audit_ssh(target, args.sudo, inventory, evidence,
-                                             args.files, args.remote_os, args.remote_python))
+                                             args.files, args.remote_os, args.remote_python, args.draft_inventory))
                 elif mode == "container":
-                    reports.append(audit_container(target, args.engine, inventory, evidence, args.files, args.remote_python))
+                    reports.append(audit_container(target, args.engine, inventory, evidence, args.files, args.remote_python, args.draft_inventory))
                 elif mode in ("http", "http-details", "multipart"):
                     reports.append(audit_http(target, mode == "http-details", mode == "multipart"))
                 elif mode == "probe":
@@ -1506,16 +1915,18 @@ def main(argv=None):
                 else:
                     reports.append(audit_logs(target, events=mode == "process-events"))
             except (AuditError, OSError, ValueError, TypeError) as exc:
-                failure = finish([], [str(exc)], mode)
+                failure = finish([], [str(exc)], mode, diagnostics=[error_diagnostic(exc)])
                 failure["target"] = target
                 reports.append(failure)
         if not reports or (args.files and not (args.ssh or args.container)):
-            reports.append(audit_local(inventory, evidence, args.files))
+            reports.append(draft_inventory() if args.draft_inventory else audit_local(inventory, evidence, args.files))
     except (AuditError, OSError, ValueError, TypeError, EOFError, zlib.error) as exc:
-        reports = [finish([], [str(exc)])]
+        reports = [finish([], [str(exc)], diagnostics=[error_diagnostic(exc)])]
     status = 1 if any(r["exit_status"] == 1 for r in reports) else (
         2 if any(r["exit_status"] == 2 for r in reports) else 0)
-    if args.json:
+    if args.draft_inventory and len(reports) == 1 and "draft_inventory" in reports[0]:
+        print(json.dumps(reports[0]["draft_inventory"], indent=2))
+    elif args.json:
         print(json.dumps({"schema": 1, "exit_status": status, "reports": reports}, indent=2))
     else:
         for report in reports:
@@ -1534,8 +1945,13 @@ def main(argv=None):
                     print("    Version resource (hint): " + json.dumps(row["version_hint"]))
                 if row["restart_needed"]:
                     print("    RESTART REQUIRED: running file was removed/replaced; re-audit afterward")
+                for finding in row.get("diagnostics", []):
+                    print("    " + finding["code"] + ": " + json.dumps(finding["next_step"]))
+                    print("    Guidance: " + json.dumps(finding["guidance"]))
             for issue in report["issues"]:
                 print("  " + json.dumps(issue))
+            for finding in report.get("diagnostics", []):
+                print("  " + finding["code"] + ": " + json.dumps(finding["next_step"]))
             if report["mode"] == "http":
                 print("  HTTP evidence: " + json.dumps(report.get("headers", {})))
             for field in ("version_hints", "phpinfo_settings", "cms_hints", "multipart", "counts", "observations", "limitations"):
