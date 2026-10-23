@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""PHP2Shell audit: Linux/Windows discovery, portable file checks and remote inspection."""
+"""PHP2Shell audit: Linux/macOS/Windows discovery, file checks and remote inspection."""
 
 import argparse
 import base64
+import bz2
+import ctypes
+import errno
 import gzip
 import hashlib
 import html
 import http.client
 import json
+import lzma
 import ntpath
 import os
 import re
 import secrets
 import shlex
+import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,12 +30,13 @@ import zlib
 from contextlib import ExitStack
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 CVES = ("CVE-2026-109618", "CVE-2026-109619")
 BASELINES = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
 KINDS = {"fpm", "mod_php", "cgi", "lsphp", "frankenphp", "php", "embedded"}
 MAX_CONFIG = 1024 * 1024
+MAX_ARCHIVE = 512 * 1024 * 1024
 # Both Ubuntu CVE pages confirmed these package revisions on 2026-10-22.
 UBUNTU_FIXES = {
     ("14.04", "php5"): "5.5.9+dfsg-1ubuntu4.29+esm18",
@@ -161,7 +168,7 @@ def validate_config(inventory, evidence):
             keys.add(key)
     require(isinstance(evidence, dict) and evidence.get("schema") == 1,
             "Evidence must have schema=1")
-    for field in ("vendor_fixes", "builds", "rpm_advisories"):
+    for field in ("vendor_fixes", "builds", "rpm_advisories", "package_archives"):
         require(isinstance(evidence.get(field, []), list), "Invalid evidence list: " + field)
     seen = set()
     for row in evidence.get("vendor_fixes", []):
@@ -191,6 +198,22 @@ def validate_config(inventory, evidence):
             require(isinstance(row["fixed_cves"], list) and sorted(row["fixed_cves"]) == sorted(CVES),
                     "Build fixed_cves must establish fixes for both CVEs")
         seen.add(row["sha256"])
+    seen = set()
+    for row in evidence.get("package_archives", []):
+        require(isinstance(row, dict) and row.get("manager") in ("homebrew", "macports"),
+                "Package archive needs manager homebrew or macports")
+        for field in ("package", "version", "php_version", "source"):
+            require(isinstance(row.get(field), str) and row[field].strip(),
+                    "Package archive needs " + field)
+        require(absolute_path(row.get("path")) and isinstance(row.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", row["sha256"]),
+                "Package archive needs an absolute path and SHA-256")
+        if "fixed_cves" in row:
+            require(isinstance(row["fixed_cves"], list) and sorted(row["fixed_cves"]) == sorted(CVES),
+                    "Package archive fixed_cves must cover both CVEs")
+        key = row["manager"], row["package"], row["version"]
+        require(key not in seen, "Duplicate package archive")
+        seen.add(key)
     for row in evidence.get("rpm_advisories", []):
         require(isinstance(row, dict), "Invalid imported RPM advisory")
         for key in ("os_id", "os_version", "package", "version", "arch"):
@@ -338,8 +361,10 @@ class Runtime:
 def discover(inventory):
     if sys.platform == "win32":
         return discover_windows(inventory)
+    if sys.platform == "darwin":
+        return discover_macos(inventory)
     require(sys.platform.startswith("linux"),
-            "Process inspection supports Linux and Windows; use --files for other systems")
+            "Process inspection supports Linux, macOS and Windows; use --files for other systems")
     expected = {row["path"]: row["kind"] for row in (inventory or {}).get("runtimes", [])
                 if row["kind"] != "mod_php"}
     runtimes, issues = [], []
@@ -465,6 +490,169 @@ def discover_windows(inventory):
     return runtimes, snapshot["issues"]
 
 
+class MacOSProcesses:
+    """Read process identities and mapped vnodes through libproc."""
+
+    class BSDInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint32) for name in (
+            "flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid",
+            "rgid", "svuid", "svgid", "reserved")]
+        _fields_ += [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)]
+        _fields_ += [(name, ctypes.c_uint32) for name in ("nfiles", "pgid", "jobc", "tdev", "tpgid")]
+        _fields_ += [("nice", ctypes.c_int32), ("seconds", ctypes.c_uint64), ("microseconds", ctypes.c_uint64)]
+
+    class RegionInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint32) for name in ("protection", "max_protection", "inheritance", "flags")]
+        _fields_ += [("offset", ctypes.c_uint64)]
+        _fields_ += [(name, ctypes.c_uint32) for name in (
+            "behavior", "wired", "tag", "resident", "private_shared", "swapped", "dirty",
+            "references", "shadow_depth", "share_mode", "private", "shared", "object_id", "depth")]
+        _fields_ += [("address", ctypes.c_uint64), ("size", ctypes.c_uint64)]
+
+    class VnodeStat(ctypes.Structure):
+        _fields_ = [("device", ctypes.c_uint32), ("mode", ctypes.c_uint16), ("nlink", ctypes.c_uint16),
+                    ("inode", ctypes.c_uint64), ("uid", ctypes.c_uint32), ("gid", ctypes.c_uint32)]
+        _fields_ += [(name, ctypes.c_int64) for name in (
+            "atime", "atime_ns", "mtime", "mtime_ns", "ctime", "ctime_ns",
+            "birthtime", "birthtime_ns", "size", "blocks")]
+        _fields_ += [("blocksize", ctypes.c_int32), ("flags", ctypes.c_uint32),
+                    ("generation", ctypes.c_uint32), ("rdevice", ctypes.c_uint32),
+                    ("reserved", ctypes.c_int64 * 2)]
+
+    def __init__(self):
+        class RegionPath(ctypes.Structure):
+            _fields_ = [("region", MacOSProcesses.RegionInfo), ("stat", MacOSProcesses.VnodeStat),
+                        ("type", ctypes.c_int), ("padding", ctypes.c_int),
+                        ("fsid", ctypes.c_int32 * 2), ("path", ctypes.c_char * 1024)]
+        self.region_type = RegionPath
+        self.lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        self.lib.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.proc_listallpids.restype = ctypes.c_int
+        self.lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        self.lib.proc_pidinfo.restype = ctypes.c_int
+        self.lib.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        self.lib.proc_pidpath.restype = ctypes.c_int
+
+    def pids(self):
+        for _ in range(3):
+            count = self.lib.proc_listallpids(None, 0)
+            require(0 < count < 1000000, "Cannot enumerate macOS processes")
+            buffer = (ctypes.c_int * (count + 128))()
+            used = self.lib.proc_listallpids(buffer, ctypes.sizeof(buffer))
+            require(used > 0, "Cannot enumerate macOS processes")
+            if used < len(buffer):
+                return sorted(set(pid for pid in buffer[:used] if pid > 0))
+        raise AuditError("macOS process list kept growing during enumeration")
+
+    def info(self, pid, flavor, data, address=0):
+        ctypes.set_errno(0)
+        size = self.lib.proc_pidinfo(pid, flavor, address, ctypes.byref(data), ctypes.sizeof(data))
+        if size <= 0:
+            code = ctypes.get_errno() or errno.EIO
+            raise OSError(code, os.strerror(code))
+        require(size == ctypes.sizeof(data), "Incomplete macOS process information")
+        return data
+
+    def identity(self, pid):
+        data = self.info(pid, 3, self.BSDInfo())  # PROC_PIDTBSDINFO
+        require(data.pid == pid, "macOS process identity mismatch")
+        if data.status == 5:  # SZOMB
+            raise ProcessLookupError(errno.ESRCH, "Process is a zombie")
+        return f"{data.seconds}:{data.microseconds}"
+
+    def executable(self, pid):
+        buffer = ctypes.create_string_buffer(4096)
+        ctypes.set_errno(0)
+        size = self.lib.proc_pidpath(pid, buffer, len(buffer))
+        if size <= 0:
+            code = ctypes.get_errno() or errno.EIO
+            raise OSError(code, os.strerror(code))
+        path = os.fsdecode(buffer.value)
+        require(absolute_path(path), "Invalid macOS executable path")
+        return path
+
+    def mappings(self, pid):
+        address, mappings = 0, {}
+        for index in range(100000):
+            try:
+                data = self.info(pid, 8, self.region_type(), address)  # PROC_PIDREGIONPATHINFO
+            except OSError as exc:
+                if exc.errno == errno.EINVAL and index:
+                    return list(mappings.values())
+                raise
+            end = data.region.address + data.region.size
+            require(data.region.address >= address and end > address and end < 2 ** 64,
+                    "Invalid macOS memory region")
+            address = end
+            path = os.fsdecode(data.path)
+            if path:
+                require(absolute_path(path), "Invalid macOS mapped-file path")
+                row = {"path": path, "device": data.stat.device, "inode": data.stat.inode,
+                       "nlink": data.stat.nlink}
+                key = path, row["device"], row["inode"]
+                mappings[key] = row
+        raise AuditError("macOS memory-region limit exceeded")
+
+
+def discover_macos(inventory):
+    api = MacOSProcesses()
+    expected = {os.path.realpath(row["path"]): row["kind"] for row in (inventory or {}).get("runtimes", [])}
+    runtimes, issues = [], []
+    for pid in api.pids():
+        try:
+            started = api.identity(pid)
+            exe = api.executable(pid)
+            kind = expected.get(os.path.realpath(exe)) or executable_kind(exe)
+            try:
+                mappings = api.mappings(pid)
+            except (OSError, AuditError) as exc:
+                if kind:
+                    runtimes.append(Runtime(pid, kind, exe, exe, started))
+                raise AuditError("cannot inspect mapped files: " + str(exc)) from exc
+            found = []
+            for item in mappings:
+                path = item["path"]
+                module = re.fullmatch(r"(?:libphp|mod_php)[^/]*\.(?:so|dylib)(?:\.[0-9]+)*", Path(path).name, re.I)
+                item_kind = expected.get(os.path.realpath(path)) or (kind if path == exe else None)
+                if item_kind or module:
+                    found.append(Runtime(pid, item_kind or "mod_php", path, path, started,
+                                         item["nlink"] == 0, item["device"], item["inode"]))
+            if kind and not any(r.kind == kind and r.path == exe for r in found):
+                found.append(Runtime(pid, kind, exe, exe, started))
+                issues.append(f"PID {pid}: executable mapping not available")
+            require(api.identity(pid) == started, "Process identity changed during discovery")
+            runtimes.extend(found)
+        except ProcessLookupError:
+            continue
+        except (OSError, AuditError) as exc:
+            issues.append(f"PID {pid}: macOS inspection incomplete: {exc}")
+    return runtimes, issues
+
+
+def hash_macos_runtime(runtime):
+    api = MacOSProcesses()
+    require(api.identity(runtime.pid) == runtime.start, "Process exited or PID was reused")
+    require(runtime.inode > 0 and not runtime.deleted, "Running macOS file has no readable vnode identity")
+    with open(runtime.live_path, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require((before.st_dev, before.st_ino) == (runtime.device, runtime.inode),
+                "macOS pathname no longer identifies the running mapping; restart and re-audit")
+        hashes, info = hash_stream(stream)
+        mappings = api.mappings(runtime.pid)
+        require(any((row["device"], row["inode"]) == (info.st_dev, info.st_ino) for row in mappings),
+                "macOS mapping changed during inspection")
+        require(api.identity(runtime.pid) == runtime.start, "Process exited or PID was reused")
+        after = os.fstat(stream.fileno())
+        require((info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
+                (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "Running file changed during inspection")
+    try:
+        current = os.stat(runtime.path)
+        restart = (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+    except FileNotFoundError:
+        restart = True
+    return hashes, restart
+
+
 def hash_stream(stream):
     info = os.fstat(stream.fileno())
     require(stat.S_ISREG(info.st_mode), "Image is not a regular file")
@@ -494,6 +682,8 @@ def hash_file(path):
 
 
 def hash_runtime(runtime):
+    if sys.platform == "darwin":
+        return hash_macos_runtime(runtime)
     require(start_time(runtime.pid) == runtime.start, "Process exited or PID was reused")
     with ExitStack() as stack:
         try:
@@ -655,7 +845,121 @@ def pacman_metadata(path):
             "algorithm": "sha256", "digest": matches[0]}
 
 
+def macos_package_metadata(path):
+    target = Path(path).resolve(strict=True)
+    for keg in target.parents:
+        if keg.parent.parent.name != "Cellar":
+            continue
+        receipt = keg / "INSTALL_RECEIPT.json"
+        data = load_json(receipt)
+        require(isinstance(data, dict) and isinstance(data.get("source"), dict), "Invalid Homebrew receipt")
+        tap = data["source"].get("tap")
+        require(isinstance(tap, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", tap),
+                "Homebrew receipt has no valid source tap")
+        return {"manager": "homebrew", "package": tap + "/" + keg.parent.name,
+                "version": keg.name, "receipt": str(receipt),
+                "archive_member": target.relative_to(keg.parent.parent).as_posix()}
+    owners = []
+    prefixes = set(target.parents) | {Path("/opt/local")}
+    for prefix in sorted(prefixes):
+        database = prefix / "var/macports/registry/registry.db"
+        if not database.is_file():
+            continue
+        try:
+            with ExitStack() as stack:
+                connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=2)
+                stack.callback(connection.close)
+                connection.execute("PRAGMA query_only=ON")
+                rows = connection.execute(
+                    "SELECT p.name, p.epoch, p.version, p.revision, p.variants, f.path "
+                    "FROM files AS f JOIN ports AS p ON p.id=f.id "
+                    "WHERE f.actual_path=? AND f.active=1 AND p.state='installed'",
+                    (str(target),)).fetchmany(2)
+                for name, epoch, version, revision, variants, original in rows:
+                    require(all(isinstance(value, str) for value in (name, version, variants))
+                            and type(epoch) is int and type(revision) is int and absolute_path(original),
+                            "Invalid MacPorts registry entry")
+                    owners.append({"manager": "macports", "package": name,
+                                   "version": f"{epoch}:{version}_{revision}{variants}",
+                                   "receipt": str(database), "archive_member": original.lstrip("/")})
+        except sqlite3.Error as exc:
+            raise AuditError("Cannot read MacPorts registry: " + str(exc)) from exc
+    require(len(owners) == 1, "No unique Homebrew/MacPorts owner; supply SHA-256 build evidence")
+    return owners[0]
+
+
+class BoundedArchiveReader:
+    def __init__(self, stream):
+        self.stream, self.remaining = stream, MAX_ARCHIVE
+
+    def read(self, size=-1):
+        size = self.remaining + 1 if size < 0 else min(size, self.remaining + 1)
+        data = self.stream.read(size)
+        require(len(data) <= self.remaining, "Package archive exceeds 512 MiB unpacked")
+        self.remaining -= len(data)
+        return data
+
+
+class PackageTarInfo(tarfile.TarInfo):
+    @classmethod
+    def frombuf(cls, buf, encoding, errors):
+        info = super().frombuf(buf, encoding, errors)
+        require(0 <= info.size <= MAX_ARCHIVE, "Package archive member exceeds size limit")
+        if info.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK):
+            require(info.size <= MAX_CONFIG, "Package archive metadata exceeds 1 MiB")
+        return info
+
+
+def package_archive_digest(package, evidence):
+    entries = [row for row in evidence.get("package_archives", [])
+               if all(row[key] == package[key] for key in ("manager", "package", "version"))]
+    require(len(entries) == 1,
+            "Package ownership/version found, but no file checksum; supply a trusted package archive or build hash")
+    entry = entries[0]
+    matches = []
+    try:
+        with ExitStack() as stack:
+            stream = stack.enter_context(open(entry["path"], "rb"))
+            require(os.fstat(stream.fileno()).st_size <= MAX_ARCHIVE, "Package archive exceeds 512 MiB")
+            hashes, before = hash_stream(stream)
+            require(hashes["sha256"] == entry["sha256"], "Package archive SHA-256 mismatch")
+            stream.seek(0)
+            magic = stream.read(6)
+            stream.seek(0)
+            decoded = stream
+            if magic.startswith(b"\x1f\x8b"):
+                decoded = stack.enter_context(gzip.GzipFile(fileobj=stream))
+            elif magic.startswith(b"BZh"):
+                decoded = stack.enter_context(bz2.BZ2File(stream))
+            elif magic.startswith(b"\xfd7zXZ\x00"):
+                decoded = stack.enter_context(lzma.LZMAFile(stream))
+            with tarfile.open(fileobj=BoundedArchiveReader(decoded), mode="r|", tarinfo=PackageTarInfo) as archive:
+                for count, member in enumerate(archive):
+                    require(count < 100000 and member.offset_data + member.size <= MAX_ARCHIVE,
+                            "Package archive exceeds unpacked size/member limit")
+                    name = PurePosixPath(member.name)
+                    require(not name.is_absolute() and ".." not in name.parts,
+                            "Invalid package archive member path")
+                    if str(name) != package["archive_member"]:
+                        continue
+                    require(member.isfile() and not member.issparse(), "Package artifact must be a regular archive file")
+                    digest = hashlib.sha256()
+                    with archive.extractfile(member) as source:
+                        for block in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(block)
+                    matches.append(digest.hexdigest())
+            after = os.fstat(stream.fileno())
+            require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                    (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "Package archive changed while reading")
+    except (tarfile.TarError, EOFError, lzma.LZMAError, zlib.error) as exc:
+        raise AuditError("Invalid package tar archive: " + str(exc)) from exc
+    require(len(matches) == 1, "Package archive has no unique matching file")
+    return matches[0], entry
+
+
 def package_metadata(path):
+    if sys.platform == "darwin":
+        return macos_package_metadata(path)
     require(sys.platform.startswith("linux"), "Use SHA-256 build evidence for this platform")
     if Path("/var/lib/dpkg/status").is_file():
         return dpkg_metadata(path)
@@ -734,6 +1038,12 @@ def inspect_runtime(runtime, distro, evidence):
             record["status"] = "UNKNOWN"
             record["detail"] += "; Windows module paths do not prove loaded-image identity; file status is separate"
             return record
+        if sys.platform == "darwin" and runtime.inode:
+            try:
+                current = os.stat(runtime.path)
+                record["restart_needed"] |= (current.st_dev, current.st_ino) != (runtime.device, runtime.inode)
+            except FileNotFoundError:
+                record["restart_needed"] = True
         hashes, restart = hash_runtime(runtime)
         record.update(sha256=hashes["sha256"], restart_needed=restart)
         assess_file(record, hashes, distro, evidence)
@@ -751,6 +1061,16 @@ def assess_file(record, hashes, distro, evidence):
         return
     package = package_metadata(record["path"])
     record.update(package=package["package"], package_version=package["version"])
+    if package.get("manager") in ("homebrew", "macports"):
+        record["manager"] = package["manager"]
+        record["package_receipt"] = package["receipt"]
+        expected, entry = package_archive_digest(package, evidence)
+        require(hashes["sha256"] == expected,
+                "File differs from package archive; relocated/modified builds require separate SHA-256 build evidence")
+        record.update(status="PATCHED" if entry.get("fixed_cves") else upstream_status(entry["php_version"]),
+                      php_version=entry["php_version"], source=entry["source"],
+                      detail="File SHA-256 matches a file in the trusted package archive")
+        return
     require(hashes[package["algorithm"]] == package["digest"],
             "File differs from installed package checksum; patch status unresolved")
     record["manager"] = package["manager"]
@@ -797,6 +1117,10 @@ def finish(records, issues, mode="local", scope=None):
 
 def audit_local(inventory, evidence, files=False):
     validate_config(inventory, evidence)
+    key = os.path.realpath if sys.platform == "darwin" else path_key
+    if inventory is not None:
+        keys = {(row["kind"], key(row["path"])) for row in inventory["runtimes"]}
+        require(len(keys) == len(inventory["runtimes"]), "Duplicate inventory runtime through path aliases")
     if files:
         require(inventory is not None, "--files requires an explicit --inventory")
         try:
@@ -814,12 +1138,12 @@ def audit_local(inventory, evidence, files=False):
     if inventory is None:
         issues.append("No confirmed inventory: automatic discovery cannot prove deployment coverage")
     else:
-        expected = {(row["kind"], path_key(row["path"])): row["label"] for row in inventory["runtimes"]}
-        found = {(r.kind, path_key(r.path)) for r in runtimes}
-        for key in expected.keys() - found:
-            issues.append("Expected runtime not observed: " + expected[key] + " (" + key[1] + ")")
-        for key in found - expected.keys():
-            issues.append("Runtime missing from inventory: " + key[0] + " " + key[1])
+        expected = {(row["kind"], key(row["path"])): row["label"] for row in inventory["runtimes"]}
+        found = {(r.kind, key(r.path)) for r in runtimes}
+        for missing in expected.keys() - found:
+            issues.append("Expected runtime not observed: " + expected[missing] + " (" + missing[1] + ")")
+        for extra in found - expected.keys():
+            issues.append("Runtime missing from inventory: " + extra[0] + " " + extra[1])
     try:
         distro = os_release()
     except (OSError, AuditError):
@@ -1123,7 +1447,7 @@ def main(argv=None):
     parser.add_argument("--files", action="store_true", help="Audit only installed files from inventory, including inactive deployments")
     parser.add_argument("--container", action="append", default=[], metavar="NAME_OR_ID")
     parser.add_argument("--engine", choices=("docker", "podman"), default="docker")
-    parser.add_argument("--remote-os", choices=("linux", "windows"), default="linux")
+    parser.add_argument("--remote-os", choices=("linux", "macos", "windows"), default="linux")
     parser.add_argument("--remote-python", help="Absolute target Python path; required for Windows SSH")
     parser.add_argument("--probe-php", action="append", default=[], metavar="TRUSTED_BINARY",
                         help="Opt-in: execute this local trusted PHP binary with -n -v; hints only")
@@ -1132,7 +1456,7 @@ def main(argv=None):
     parser.add_argument("--updateinfo", action="append", default=[], metavar="XML_OR_GZ", help="Trusted RPM repository updateinfo metadata")
     parser.add_argument("--updateinfo-os", metavar="ID:VERSION", help="Exact target OS/release covered by supplied updateinfo")
     parser.add_argument("--inventory", help="Explicit expected runtime inventory JSON")
-    parser.add_argument("--evidence", help="Trusted vendor fixes/custom-build provenance JSON")
+    parser.add_argument("--evidence", help="Trusted vendor fixes, build hashes or package archives JSON")
     parser.add_argument("--json", action="store_true", help="Emit full machine-readable evidence")
     args = parser.parse_args(argv)
     try:
@@ -1143,7 +1467,8 @@ def main(argv=None):
         require(not args.probe_php or not (args.ssh or args.container), "--probe-php executes locally; use a separate invocation")
         require(not args.files or args.inventory, "--files requires --inventory")
         require(not args.remote_python or args.ssh or args.container, "--remote-python requires --ssh or --container")
-        require(args.remote_os != "windows" or (args.ssh and not args.container), "--remote-os windows requires SSH, not container transport")
+        require(args.remote_os == "linux" or (args.ssh and not args.container),
+                "--remote-os macos/windows requires SSH, not container transport")
         require(bool(args.updateinfo) == bool(args.updateinfo_os), "Use --updateinfo together with --updateinfo-os ID:VERSION")
         inventory = load_json(args.inventory) if args.inventory else None
         evidence = load_json(args.evidence) if args.evidence else {"schema": 1}
@@ -1201,6 +1526,8 @@ def main(argv=None):
             for row in report["runtimes"]:
                 print(f'  {row["status"]}: PID {row["pid"]} {row["kind"]} {json.dumps(row["path"])}')
                 print("    " + json.dumps(row.get("detail", "")))
+                if row.get("manager") in ("homebrew", "macports"):
+                    print("    Package: " + json.dumps(row["manager"] + " " + row["package"] + " " + row["package_version"]))
                 if "file_status" in row:
                     print("    Installed file: " + row["file_status"] + "; loaded image unverified")
                 if row.get("version_hint"):

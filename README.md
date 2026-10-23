@@ -1,8 +1,8 @@
 # PHP2Shell patch audit
 
 Checks PHP installations for fixes for PHP2Shell (CVE-2026-109618 and
-CVE-2026-109619). Supports running executables and modules on Linux, process and
-DLL discovery on Windows, installed-file checks, SSH and container access,
+CVE-2026-109619). Supports running executables and modules on Linux and macOS,
+process and DLL discovery on Windows, installed-file checks, SSH and container access,
 HTTP/phpinfo checks, multipart-filter checks, and log/event inspection.
 By default, it reads PHP files without executing them. `--probe-php` runs a
 selected trusted binary; `--multipart-check` sends a small POST.
@@ -39,7 +39,8 @@ Custom installations can use inventory paths and build records tied to SHA-256 h
 | Arch Linux, Manjaro and compatible pacman-based derivatives | Linux process/mapping identity, package ownership, mtree SHA-256 and native `vercmp`. | Vendor rules or build evidence; no built-in Arch/Manjaro thresholds. |
 | Gentoo, NixOS, Slackware, other Linux, and custom/embedded builds | Linux process/mapping identity and explicit runtime inventory. | SHA-256-bound build evidence. No Portage, Nix or Slackware package adapter is implemented. |
 | Windows desktop and Windows Server installations with Python and Windows PowerShell | Native process/DLL discovery, file hashes and PE version-resource hints; Windows OpenSSH transport. | Installed-file verdicts require build evidence. Running-image status remains `UNKNOWN`, with separate `file_status`. See the Windows versions tested below. |
-| macOS; FreeBSD, OpenBSD, NetBSD and other compatible Python hosts | Explicit installed-file assessment, HTTP and log observations. | SHA-256-bound build evidence for listed files. No native process collector, Homebrew/MacPorts or BSD package adapter is implemented. |
+| macOS on Apple Silicon or Intel, with readable native process information | Native executable/module discovery and mapped-file identity through libproc; Homebrew receipt and MacPorts registry ownership; local and SSH checks. | A trusted package archive with matching file bytes, or SHA-256-bound build evidence. Package ownership/version alone remains `UNKNOWN`. Intel and older macOS releases have not been tested. |
+| FreeBSD, OpenBSD, NetBSD and other compatible Python hosts | Explicit installed-file assessment, HTTP and log observations. | SHA-256-bound build evidence for listed files. No native BSD process collector or package adapter is implemented. |
 
 Linux containers and WSL use the backend for their guest distribution. Audit each
 deployment namespace separately; a guest report does not cover its host or other
@@ -74,8 +75,9 @@ their parent distribution's thresholds. Missing vendor/build evidence remains
 
 ### Tested environments
 
-Tests on 2026-10-22 used system executables as stand-ins for PHP. Vulnerable and
-patched PHP deployments were not tested.
+Linux and Windows tests on 2026-10-22 used system executables as stand-ins for PHP.
+The macOS native tests on 2026-10-23 used a compiled fixture executable and shared
+library. Vulnerable and patched PHP deployments were not tested.
 
 | Environment | Tests run |
 | --- | --- |
@@ -85,12 +87,14 @@ patched PHP deployments were not tested.
 | Arch rolling container under amd64 emulation | pacman mtree checksum and native version comparison; procfs checks were not tested under emulation. |
 | Windows build 26300, Python 3.13.15, Windows PowerShell 5.1 | Native file evidence, path casing, PE resources, process/DLL discovery, and key-authenticated Windows SSH. The report includes access errors and cannot verify loaded images. |
 | macOS controller | Controller execution and offline/loopback regressions; Docker transport to a temporary Debian container. |
+| macOS 27.0.1, arm64 | Native PID enumeration, executable/module discovery, mapped-file identity and replacement detection. Temporary Homebrew receipt/archive and MacPorts registry/archive fixtures; no PHP installation or live MacPorts deployment tested. |
 
-All 77 regression tests passed on 2026-10-23. The APK streaming change has unit
+All 98 regression tests passed on 2026-10-23. The APK streaming change has unit
 tests; the Alpine container test was not rerun after that change.
 Other named derivatives, Windows Server releases, BSD hosts, WSL and Podman
-transport have not been tested on those systems. Linux SSH/sudo policy,
-production PHP workloads and fleet-wide deployment coverage are also untested.
+transport have not been tested on those systems. Intel/older macOS, live macOS SSH,
+Linux SSH/sudo policy, production PHP workloads and fleet-wide deployment coverage
+are also untested. The macOS SSH command construction has a regression test.
 
 ## Patching guidance
 
@@ -267,7 +271,7 @@ python3 php2shell-audit.py --ssh auditor@windows-host --remote-os windows \
   --remote-python 'C:\Python313\python.exe' --files \
   --inventory inventory.json --evidence builds.json --json
 
-# Inactive Linux deployments or custom files on macOS/BSD use the same file mode.
+# Inactive deployments and custom files on any supported host use the same file mode.
 python3 php2shell-audit.py --files --inventory inventory.json --evidence builds.json --json
 
 # Inspect one existing Linux container via the current Docker/Podman context.
@@ -281,14 +285,55 @@ namespace; it does not install packages, pull images, execute PHP, or change ser
 Use a separate invocation and inventory for each remote host/container. The script
 does not enumerate Kubernetes/Swarm workloads or inspect image contents from tags.
 
+## macOS
+
+```sh
+# Discover running PHP executables and mapped PHP libraries on this Mac.
+python3 php2shell-audit.py --inventory inventory.json --evidence evidence.json --json
+
+# Audit a Mac over SSH; select its installed Python 3.9+ interpreter.
+python3 php2shell-audit.py --ssh auditor@mac-host --remote-os macos \
+  --remote-python /opt/homebrew/bin/python3 \
+  --inventory inventory.json --evidence evidence.json --json
+
+# Native fixture checks; requires Apple Command Line Tools and runs no PHP.
+python3 verify_macos.py
+```
+
+Use the same inventory format as Linux. Homebrew `opt`/`bin` symlinks resolve on
+the audited Mac, so inventory can use a stable path such as
+`/opt/homebrew/opt/php/sbin/php-fpm`. List Apache's PHP module separately as
+`mod_php`; discovery recognizes `libphp*.so`, `libphp*.dylib` and `mod_php*`
+libraries. Explicit paths also cover renamed or embedded runtimes. List each
+runtime once; aliases of the same path and kind are rejected.
+
+The collector uses macOS libproc to read process start times, executable paths
+and mapped-file device/inode identities. A file is hashed only when its identity
+matches the mapping; process identity, mappings and file stability are checked
+again afterward. A deleted or replaced mapping that cannot be read remains
+`UNKNOWN`, with a restart flag when detected. This checks the mapped backing
+file, not private changes to memory pages.
+
+The current user must be allowed to inspect the relevant processes. Permissions,
+System Integrity Protection and other macOS restrictions can prevent inspection,
+even with elevated privileges. Such errors remain coverage issues and prevent
+host clearance. Use `--files` to assess only the explicitly listed installed files.
+
+Homebrew ownership is read from the resolved Cellar path and its installation
+receipt. MacPorts ownership is read from the registry under the installation
+prefix, requiring exactly one active owner. Neither source supplies the file
+checksum needed for a patched verdict. Provide a trusted archive as described
+below, or use existing SHA-256 build evidence for custom or relocated files.
+
 ## Package and build evidence
 
-Running executables are read through `/proc/PID/exe`. PHP shared libraries are
+On Linux, running executables are read through `/proc/PID/exe`. PHP shared libraries are
 read through `map_files`, or through a pathname only if device/inode identity
-matches the process mapping. PID identity and file stability are checked. The
-script never executes those files, loads their configuration, or imports extensions.
+matches the process mapping. macOS uses the native mapping checks described above.
+PID identity and file stability are checked. The script never executes those files,
+loads their configuration, or imports extensions.
 
-For distribution packages, the running-file digest must match the installed
+For supported Linux distribution packages, the running-file digest must match the installed
 package database. The full package revision is then compared with a vendor fix
 using the distribution's native version comparison. A package update on disk
 does not automatically identify the old process still in memory.
@@ -345,6 +390,57 @@ For a verified custom backport, the build entry may additionally specify
 `"fixed_cves": ["CVE-2026-109618", "CVE-2026-109619"]`. This asserts that the file
 with that hash contains both fixes. The script trusts this supplied record; it
 cannot infer a backport from the version number.
+
+### Homebrew and MacPorts archives
+
+Add `package_archives` to the same evidence JSON. This Homebrew example is a
+template; replace the package/version, path, checksum and source with trusted
+records for the installed build:
+
+```json
+{
+  "schema": 1,
+  "package_archives": [
+    {
+      "manager": "homebrew",
+      "package": "homebrew/core/php",
+      "version": "8.3.36_1",
+      "path": "/absolute/path/on/audited/mac/php.bottle.tar.gz",
+      "sha256": "REPLACE_WITH_TRUSTED_ARCHIVE_SHA256",
+      "php_version": "8.3.36",
+      "source": "REPLACE_WITH_TRUSTED_RELEASE_AND_CHECKSUM_RECORD"
+    }
+  ]
+}
+```
+
+`manager`, `package` and `version` must match the reported installed package
+exactly. Homebrew package names include the tap, such as `homebrew/core/php@8.3`;
+versions use the Cellar directory name, including any `_revision`. For MacPorts,
+use `manager: "macports"`, the port name (for example `php83`), and
+`epoch:version_revision` followed by installed variants, such as
+`0:8.3.36_1+openssl`. These identifiers describe package ownership, not a built-in
+list of fixed macOS packages.
+
+Obtain both the archive SHA-256 and embedded `php_version` from trusted release or
+build records. The script trusts that association; a checksum calculated only
+from an untrusted local archive does not authenticate it. `source` records where
+that evidence came from. As with `builds`, a verified backport may supply
+`fixed_cves` containing both CVEs; otherwise the existing upstream version rules
+apply. Package version strings and PHP banners are not used as proof.
+
+The archive must already exist on the audited host; SSH transfers the evidence
+JSON, not the archive. The script verifies its SHA-256, finds the runtime's exact
+package member, and compares that member's SHA-256 with the audited file. It reads
+tar archives, optionally compressed with gzip, bzip2 or xz, without extracting
+files. Limits are 512 MiB compressed/uncompressed, 100,000 members and 1 MiB per
+extended header. Missing or duplicate members, non-regular runtime members,
+unsafe paths, changed archives and mismatched file bytes remain `UNKNOWN`.
+
+Homebrew relocation or code signing can change installed bytes relative to a
+bottle. Such files require a separate `builds` record for the installed artifact;
+the tool does not reverse relocation or assume a mismatch is safe. No archive is
+downloaded and no package manager, installation, update or restart is performed.
 
 ### RPM repository advisories
 
@@ -430,6 +526,9 @@ Linux containers, using a copy of `sleep` as a test process. `verify_windows.py`
 checks file evidence, version resources and process/DLL discovery using the current
 Python interpreter and DLL. Neither test script runs PHP. Results and untested
 platforms are listed under [Tested environments](#tested-environments).
+`verify_macos.py` compiles a temporary executable and PHP-named shared library,
+checks native mapping/replacement behavior, and exercises synthetic package
+archives and receipts. It runs no PHP or package manager and cleans up its fixtures.
 
 This is a point-in-time patch audit, not an exploitation or compromise test.
 Package databases, system tools, kernel/procfs, and supplied inventory/evidence

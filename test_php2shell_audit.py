@@ -118,6 +118,11 @@ class VersionTests(unittest.TestCase):
 
 
 class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        platform = patch.object(audit.sys, "platform", "linux")
+        platform.start()
+        self.addCleanup(platform.stop)
+
     def test_supported_executables(self):
         for filename, kind in (("php-fpm8.3", "fpm"), ("php-cgi8.3", "cgi"),
                                ("lsphp83", "lsphp"), ("frankenphp", "frankenphp"),
