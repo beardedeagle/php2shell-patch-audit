@@ -906,7 +906,7 @@ def http_details(body):
 
 def audit_http(target, details=False, multipart=False):
     target = http_target(target)
-    # Avoid ambient proxies and cross-origin redirects; neither is inventory evidence.
+    # Ignore proxy environment variables and reject redirects.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     result = finish([], ["HTTP banners are hints only; authenticated runtime evidence is required"], "http")
     result["target"] = target
@@ -925,7 +925,7 @@ def audit_http(target, details=False, multipart=False):
         result["version_hints"] = [{"version": v, "upstream_comparison": upstream_status(v)}
                                    for v in dict.fromkeys(result["reported_versions"])]
         if multipart:
-            # This opt-in test sends one ordinary field, no file or upload-progress payload.
+            # Send one ordinary field, without a file or upload-progress payload.
             boundary = "php2shell-" + secrets.token_hex(12)
             payload = ("--" + boundary + '\r\nContent-Disposition: form-data; name="test_field"\r\n\r\n'
                        + "multipart_test\r\n--" + boundary + "--\r\n").encode("ascii")

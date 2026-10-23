@@ -1,6 +1,6 @@
-"""Run inside a disposable Linux container: native package and procfs checks.
+"""Check package metadata and procfs in a disposable Linux container.
 
-Uses a copied system sleep executable as a synthetic PHP process. No PHP runs.
+A copy of sleep stands in for PHP; no PHP runtime is tested.
 """
 import hashlib
 import importlib.util

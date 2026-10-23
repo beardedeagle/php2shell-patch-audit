@@ -1,4 +1,4 @@
-"""Offline regressions for platform boundaries and supplementary observations."""
+"""Tests for platform support and additional audit methods."""
 import base64
 import contextlib
 import gzip

@@ -1,6 +1,6 @@
-"""Native Windows integration checks using this Python process, without running PHP.
+"""Check Windows file hashes, version resources and process discovery.
 
-The synthetic evidence below tests verdict mechanics; it is not PHP build provenance.
+Uses this Python interpreter and DLL as fixtures; no PHP runtime is tested.
 """
 import ctypes
 import importlib.util

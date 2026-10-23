@@ -1,11 +1,11 @@
 # PHP2Shell patch audit
 
-Patch auditing and supplementary observations for PHP2Shell (CVE-2026-109618 and
-CVE-2026-109619). Checks include Linux running artifacts, Windows process/module
-discovery, installed files on any Python-supported platform, SSH and container
-transport, HTTP/phpinfo observations, multipart-filter checks, and log/event review.
-Default inspection reads files without executing PHP. `--probe-php` explicitly
-executes a selected trusted binary; `--multipart-check` explicitly sends a small POST.
+Checks PHP installations for fixes for PHP2Shell (CVE-2026-109618 and
+CVE-2026-109619). Supports running executables and modules on Linux, process and
+DLL discovery on Windows, installed-file checks, SSH and container access,
+HTTP/phpinfo checks, multipart-filter checks, and log/event inspection.
+By default, it reads PHP files without executing them. `--probe-php` runs a
+selected trusted binary; `--multipart-check` sends a small POST.
 
 It does not patch, restart services, change configuration, or determine whether
 a host has already been compromised.
@@ -16,19 +16,154 @@ Windows PowerShell. Unix SSH/container targets default to `/usr/bin/python3`;
 `--remote-python` selects another absolute path. `--sudo` needs noninteractive
 `/usr/bin/sudo`. SSH host keys must already be trusted.
 
-| Platform/family | Evidence available |
-| --- | --- |
-| Debian, Ubuntu and dpkg derivatives | Linux process identity, package ownership/digests, native revision comparison. Built-in baselines for Debian 12/13 and the Ubuntu releases below. |
-| RHEL, Rocky, AlmaLinux, CentOS, Fedora, Oracle, Amazon Linux; SUSE/openSUSE | Linux process identity, RPM ownership/digests, native revision comparison. Built-in rules for the verified RHEL streams below; other streams/vendors use their own rules or updateinfo. |
-| Alpine | Linux process identity, APK installed-file SHA-1 checksums, native `apk version` comparison. Vendor rules required. |
-| Arch/Manjaro | Linux process identity, pacman ownership/mtree SHA-256, native `vercmp`. Vendor rules required. |
-| Other Linux, Gentoo, Nix, Slackware, custom/embedded builds | Linux process identity plus SHA-256-bound build evidence. An unsupported package database is explicit, not silently treated as RPM. |
-| Windows | Native process/module discovery, file hashes and PE version-resource hints; installed-file verdicts using build evidence. See the loaded-image limitation below. |
-| macOS/BSD and other Python platforms | Explicit installed-file checks using build evidence; HTTP and log methods. No native process collector. |
+## Platform scope
 
-Platform support does not imply that every release has a built-in advisory.
-Missing vendor/build evidence remains UNKNOWN. Derivatives do not inherit their
-parent distribution's patch thresholds automatically.
+The tables below list expected platform compatibility, built-in fix versions,
+and test coverage.
+
+### Potential platform coverage
+
+Linux discovery uses `/proc` and does not filter by distribution name. The systems
+below are expected to work with Python 3.9+, readable `/proc`, a supported package
+database format/location, and the required system utilities. Only the environments
+listed under [Tested environments](#tested-environments) have been tested.
+systemd is not required. Restricted procfs or namespaces can prevent inspection.
+Custom installations can use inventory paths and build records tied to SHA-256 hashes.
+
+| Family and example systems | Checks | Patch evidence required |
+| --- | --- | --- |
+| Debian, Ubuntu; dpkg derivatives such as Linux Mint, Pop!_OS, Kali and Raspberry Pi OS | Linux process/mapping identity, dpkg ownership and file checksums, native revision comparison. | Built-in rules only for the combinations below; other releases/derivatives need their own vendor rules or build evidence. |
+| RHEL, Rocky Linux, AlmaLinux, CentOS/CentOS Stream, Fedora, Oracle Linux and Amazon Linux | Linux process/mapping identity, RPM ownership and file checksums, native revision comparison. | Selected RHEL rules below; other vendors/streams need explicit rules, scoped RPM updateinfo, or build evidence. |
+| SUSE Linux Enterprise and openSUSE | The same generic RPM inspection path. | Vendor rules, scoped RPM updateinfo, or build evidence; no built-in SUSE/openSUSE thresholds. |
+| Alpine and compatible APK-based Linux systems | Linux process/mapping identity, installed-file `Q1` SHA-1 checksums and native APK version comparison. | Vendor rules or build evidence; no built-in Alpine thresholds. Other APK checksum encodings remain unsupported. |
+| Arch Linux, Manjaro and compatible pacman-based derivatives | Linux process/mapping identity, package ownership, mtree SHA-256 and native `vercmp`. | Vendor rules or build evidence; no built-in Arch/Manjaro thresholds. |
+| Gentoo, NixOS, Slackware, other Linux, and custom/embedded builds | Linux process/mapping identity and explicit runtime inventory. | SHA-256-bound build evidence. No Portage, Nix or Slackware package adapter is implemented. |
+| Windows desktop and Windows Server installations with Python and Windows PowerShell | Native process/DLL discovery, file hashes and PE version-resource hints; Windows OpenSSH transport. | Installed-file verdicts require build evidence. Running-image status remains `UNKNOWN`, with separate `file_status`. See the Windows versions tested below. |
+| macOS; FreeBSD, OpenBSD, NetBSD and other compatible Python hosts | Explicit installed-file assessment, HTTP and log observations. | SHA-256-bound build evidence for listed files. No native process collector, Homebrew/MacPorts or BSD package adapter is implemented. |
+
+Linux containers and WSL use the backend for their guest distribution. Audit each
+deployment namespace separately; a guest report does not cover its host or other
+guests. Docker/Podman transport has the prerequisites described below. HTTP checks
+can target any OS, but cannot verify the backend's patch status.
+
+### Built-in fix versions
+
+The script includes vendor fix versions for these OS/PHP combinations. Rules apply
+to recognized PHP runtime packages. File identity, checksums and inventory
+requirements still apply.
+
+| OS release | PHP branch covered |
+| --- | --- |
+| Ubuntu 14.04 | 5.5 |
+| Ubuntu 16.04 | 7.0 |
+| Ubuntu 18.04 | 7.2 |
+| Ubuntu 20.04 | 7.4 |
+| Ubuntu 22.04 | 8.1 |
+| Ubuntu 24.04 | 8.3 |
+| Ubuntu 26.04, 26.10 | 8.5 |
+| Debian 12 | 8.2 |
+| Debian 13 | 8.4 |
+| RHEL 8.10 | Red Hat PHP 7.4 module stream |
+| RHEL 9.8 | Red Hat PHP 8.0, non-modular |
+
+Full fixed-package revisions and evidence formats are documented under
+[Package and build evidence](#package-and-build-evidence). Older-release update
+availability may depend on vendor support entitlements. Derivatives do not inherit
+their parent distribution's thresholds. Missing vendor/build evidence remains
+`UNKNOWN`. Unsupported package databases are reported as inspection errors.
+
+### Tested environments
+
+Tests on 2026-10-22 used system executables as stand-ins for PHP. Vulnerable and
+patched PHP deployments were not tested.
+
+| Environment | Tests run |
+| --- | --- |
+| Debian 13 container | dpkg file checksum, native version comparison, Linux process identity and replacement detection. |
+| Alpine 3.24.2 container | APK file checksum, native version comparison, Linux process identity and replacement detection. |
+| Rocky Linux 9.3 container | RPM metadata/checksum, native version comparison, Linux process identity and replacement detection. This does not validate the RHEL advisory thresholds. |
+| Arch rolling container under amd64 emulation | pacman mtree checksum and native version comparison; procfs checks were not tested under emulation. |
+| Windows build 26300, Python 3.13.15, Windows PowerShell 5.1 | Native file evidence, path casing, PE resources, process/DLL discovery, and key-authenticated Windows SSH. The report includes access errors and cannot verify loaded images. |
+| macOS controller | Controller execution and offline/loopback regressions; Docker transport to a temporary Debian container. |
+
+All 77 regression tests passed on 2026-10-23. The APK streaming change has unit
+tests; the Alpine container test was not rerun after that change.
+Other named derivatives, Windows Server releases, BSD hosts, WSL and Podman
+transport have not been tested on those systems. Linux SSH/sudo policy,
+production PHP workloads and fleet-wide deployment coverage are also untested.
+
+## Patching guidance
+
+Apply updates through the repository or vendor that supplies PHP. Use the
+instructions for the installed OS release.
+
+### Confirm that the update fixes both CVEs
+
+Use the applicable advisory to identify a fixed package or build before updating:
+
+- **Upstream PHP:** [CVE-2026-109618 advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) and [CVE-2026-109619 advisory](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp).
+- **Ubuntu:** Canonical's [CVE-2026-109618](https://ubuntu.com/security/CVE-2026-109618) and [CVE-2026-109619](https://ubuntu.com/security/CVE-2026-109619) trackers list release/package status and associated notices.
+- **Debian:** the [CVE-2026-109618](https://security-tracker.debian.org/tracker/CVE-2026-109618) and [CVE-2026-109619](https://security-tracker.debian.org/tracker/CVE-2026-109619) trackers identify affected and fixed package revisions.
+- **RHEL:** [RHSA-2026:87080](https://access.redhat.com/errata/RHSA-2026:87080) covers the selected RHEL 8 PHP stream; [RHSA-2026:87151](https://access.redhat.com/errata/RHSA-2026:87151) covers the selected RHEL 9 package. Check product, release, architecture and module stream applicability.
+
+For other vendors, obtain their own advisory or trusted build evidence covering
+**both** CVEs. Backports may retain an older upstream version number. Neither a
+successful package-manager run nor the absence of available updates proves a fix.
+An end-of-life release may require extended support or migration to a supported
+release. See [Package and build evidence](#package-and-build-evidence) for what
+this audit can verify.
+
+### OS and package-manager update procedures
+
+Links checked on 2026-10-23. These guides explain how to apply updates; use the
+advisories above to check whether an update fixes PHP2Shell. Version-specific
+guides apply to the named releases. Derivatives need their own repositories and
+advisories.
+
+| System or PHP installation | Official guidance and scope |
+| --- | --- |
+| Ubuntu | [Install and manage packages](https://ubuntu.com/server/docs/how-to/software/package-management/) explains refreshing APT metadata and upgrading installed packages. |
+| Debian | [Keeping a system up to date](https://www.debian.org/doc/manuals/debian-handbook/sect.regular-upgrades.en.html) covers regular and security updates. |
+| RHEL | [Apply security errata with YUM/DNF](https://access.redhat.com/solutions/10021) covers security-, CVE- and advisory-selected updates, with release-specific instructions. |
+| Rocky Linux | [DNF package manager](https://docs.rockylinux.org/guides/package_management/dnf_package_manager/) includes package updates and upgrades. |
+| AlmaLinux | [Security errata](https://wiki.almalinux.org/documentation/errata.html) explains how to find advisories and fixed packages with DNF. It does not cover installation. |
+| Fedora installations using DNF5 | The package manager's [upgrade command](https://dnf5.readthedocs.io/en/latest/commands/upgrade.8.html) documents package upgrades and security/advisory filters. |
+| Oracle Linux | [Updating software](https://docs.oracle.com/en/operating-systems/oracle-linux/software-management/sfw-mgmt-UpdateSoftwareonEnterpriseLinux.html) and [tracking security updates and errata](https://docs.oracle.com/en/operating-systems/oracle-linux/software-management/sfw-mgmt-TrackSecurityUpdatesandErrataReleases.html). |
+| Amazon Linux 2023 | [Manage package and OS updates](https://docs.aws.amazon.com/linux/al2023/ug/managing-repos-os-updates.html) and [apply security updates in place](https://docs.aws.amazon.com/linux/al2023/ug/security-inplace-update.html). Account for AL2023's versioned repositories; these instructions do not cover Amazon Linux 2. |
+| SUSE Linux Enterprise Server 15 SP7 | [YaST online update](https://documentation.suse.com/sles/15-SP7/html/SLES-all/cha-onlineupdate-you.html) and [Zypper software management](https://documentation.suse.com/sles/15-SP7/html/SLES-all/cha-sw-cl.html) cover patches and package updates. |
+| openSUSE Leap 15.6 | [YaST online update](https://doc.opensuse.org/documentation/leap/startup/html/book-startup/cha-onlineupdate-you.html). Use the matching release's procedure for other Leap releases or Tumbleweed. |
+| Alpine Linux | [APK: upgrading packages](https://docs.alpinelinux.org/user-handbook/0.1a/Working/apk.html#_upgrading_packages) covers package-index refresh, upgrades and changed configuration files. |
+| Arch Linux | [System maintenance](https://wiki.archlinux.org/title/System_maintenance) requires full system upgrades; partial upgrades are unsupported. Manjaro users need their own release/update guidance. |
+| Gentoo | [Upgrading Gentoo](https://wiki.gentoo.org/wiki/Upgrading_Gentoo) describes repository synchronization, package updates and configuration handling. |
+| NixOS | [Upgrading NixOS](https://nixos.org/manual/nixos/stable/#sec-upgrading) covers channel updates and rebuilding/activating the system. Separately pinned PHP inputs also need updating. |
+| Slackware | [slackpkg documentation](https://slackpkg.org/documentation.html) covers refreshing package lists and upgrading packages from the selected Slackware mirror. |
+| Windows desktop / Windows Server, standalone PHP | [Official PHP Windows downloads](https://www.php.net/downloads.php?os=windows) and [pre-built binary installation requirements](https://www.php.net/manual/en/install.windows.manual.php). Match architecture, TS/NTS build, web-server integration and extensions; Windows Update does not update a standalone PHP installation. |
+| macOS, package-managed PHP | [Homebrew package updates](https://docs.brew.sh/FAQ#how-do-i-update-my-local-packages) or [MacPorts upgrade](https://guide.macports.org/#using.port.upgrade), according to how PHP was installed. |
+| FreeBSD | [Packages and Ports handbook](https://docs.freebsd.org/en/books/handbook/ports/) includes upgrading installed packages with `pkg`; base-OS updates alone do not update PHP packages. |
+| OpenBSD | [Package management: updating packages](https://www.openbsd.org/faq/faq15.html#PkgUpdate) covers `pkg_add -u`; base-system patches alone do not update PHP packages. |
+| NetBSD / pkgsrc binary packages | [Updating packages with pkgin](https://www.netbsd.org/docs/pkgsrc/using.html#using.pkgin_update) covers package metadata and binary-package upgrades. |
+
+### Bundled runtimes, containers and verification
+
+For hosting panels, appliances, XAMPP/WampServer, LiteSpeed/LSAPI, FrankenPHP or
+other embedded/custom PHP, follow the product or build maintainer's update process.
+Updating the host's default PHP package may leave these runtimes unchanged. For
+standalone source builds, use an applicable fixed [official PHP release](https://www.php.net/downloads.php)
+or a verified backport and retain build evidence for the resulting artifacts.
+
+For containers, follow [Docker's image rebuild guidance](https://docs.docker.com/build/building/best-practices/#rebuild-your-images-often),
+update the PHP-containing base image or build inputs, and redeploy the resulting
+image. Updating only the host or pulling an image does not replace running
+containers. WSL distributions need their own Linux package updates separately
+from Windows updates.
+
+After updating, restart or replace every affected PHP worker/service/container
+using its deployment procedure, verify application health, and re-run the audit
+with current inventory and evidence. Refresh evidence from trusted vendor/build
+records; do not relabel an unknown artifact as patched. Windows running-image
+uncertainty and the other [audit limits](#limits-and-trust) still apply. Request
+filtering or upload-progress configuration changes are partial mitigations, not
+proof that both CVEs are fixed.
 
 ## Running it
 
@@ -48,7 +183,7 @@ python3 php2shell-audit.py --ssh auditor@host --sudo --inventory inventory.json 
 # HEAD, with GET fallback on 405/501; always UNKNOWN, never patch clearance.
 python3 php2shell-audit.py --http https://example.com --json
 
-# Additional method regressions include loopback HTTP servers, never external targets.
+# Run tests; HTTP tests use local loopback servers.
 python3 -m unittest discover -q
 ```
 
@@ -74,9 +209,9 @@ unless a trusted build entry independently identifies that old image.
 ## Inventory and coverage
 
 Copy `inventory.example.json` to `inventory.json`. Replace its example with the
-runtime paths actually expected from your deployment/service/container inventory.
+runtime paths from your deployment, service or container inventory.
 Set `coverage_confirmed` to `true` only after confirming that inventory covers the
-stated scope. The example intentionally cannot clear anything without editing.
+stated scope. The unedited example will return `UNKNOWN`.
 
 Each entry has `label`, `kind`, and the absolute path seen for the running
 executable or mapped PHP module. Supported kinds: `fpm`, `mod_php`, `cgi`, `lsphp`,
@@ -88,8 +223,8 @@ Automatic discovery examines executable identity and mapped PHP libraries across
 visible processes. It does not infer PHP versions from CLI binaries, process
 names, or web headers. Inventory-specified paths also cover renamed/custom
 executables and PHP libraries. Apache modules are inspected independently of FPM
-and LiteSpeed. Bare Caddy is treated conservatively as a possible embedded runtime
-and needs evidence or investigation; its name cannot establish its PHP contents.
+and LiteSpeed. Caddy is reported as a possible embedded runtime; check whether
+it contains PHP and provide build evidence if it does.
 
 Missing expected runtimes, unexpected runtimes, unreadable processes, or absent
 inventory prevent clearance. Inactive services and scaled-to-zero applications
@@ -143,8 +278,8 @@ python3 php2shell-audit.py --engine podman --container php-app --remote-python /
 Container transport requires a Unix controller and Python already present in the
 container. It sends this script through stdin and runs it in that container's
 namespace; it does not install packages, pull images, execute PHP, or change services.
-Use a separate invocation and inventory for each remote host/container. The audit
-does not claim Kubernetes/Swarm fleet coverage or infer deployed contents from tags.
+Use a separate invocation and inventory for each remote host/container. The script
+does not enumerate Kubernetes/Swarm workloads or inspect image contents from tags.
 
 ## Package and build evidence
 
@@ -163,8 +298,8 @@ Built-in rules cover the documented Ubuntu PHP runtime packages for 14.04,
 advisories checked on 2026-10-22. Availability of older-release updates depends on
 the relevant Ubuntu support entitlement. Rules do not apply to other distributions
 or unrelated package names. A PPA/private repository using the same names and
-versions is not independently authenticated by this audit: package provenance is
-an administrative prerequisite, not something a version string can prove.
+versions cannot be authenticated from its version string. Verify the package's
+origin before relying on the result.
 
 Debian/other dpkg distributions and RPM distributions need operator-supplied,
 vendor-verified rules outside the built-in cases. Debian 12 `php8.2` is fixed at
@@ -203,12 +338,13 @@ that exact OS/release/manager/package tuple and are trusted configuration.
 
 For a custom PHP/FrankenPHP/LSAPI build, add a `builds` entry with `sha256`,
 `php_version`, and `source`. Obtain the digest and the embedded PHP version from
-trusted build/release provenance, not by executing an untrusted file or copying
-its banner. `source` should identify the build record or signed manifest.
+trusted build or release records. Do not execute an untrusted file or use its
+banner as evidence. `source` should identify the build record or signed manifest.
 The SHA-256 must identify the actual executable or mapped module being audited.
 For a verified custom backport, the build entry may additionally specify
-`"fixed_cves": ["CVE-2026-109618", "CVE-2026-109619"]`. This is an explicit trusted
-build-provenance assertion bound to that hash, not an inference from an old version.
+`"fixed_cves": ["CVE-2026-109618", "CVE-2026-109619"]`. This asserts that the file
+with that hash contains both fixes. The script trusts this supplied record; it
+cannot infer a backport from the version number.
 
 ### RPM repository advisories
 
@@ -220,11 +356,11 @@ python3 php2shell-audit.py --inventory inventory.json \
 Supply `updateinfo.xml` or gzip metadata from the target's trusted package
 repository and bind it to the **exact** target OS ID/version. Obtain and verify
 the repository metadata through your normal trusted repository process first;
-this tool does not authenticate arbitrary XML or its claimed provenance.
+this tool does not authenticate the XML or its source.
 It matches binary package name, architecture, PHP major/minor branch and module
 stream/context, and requires fixes covering both CVEs. Separate advisories for
 the two CVEs are combined using native RPM version ordering. Metadata for another
-vendor, release, architecture or stream cannot silently clear the target.
+vendor, release, architecture or stream cannot establish the target's patch status.
 
 ## Additional checking methods
 
@@ -287,16 +423,13 @@ backports use vendor rules instead of these upstream-number comparisons.
 
 ## Limits and trust
 
-The included offline regression suite covers verdicts, discovery, runtime identity,
-package evidence, version handling, HTTP observations, and remote failure handling.
-`verify_native.py` exercises native package digests/version comparison and procfs
-identity/replacement using a synthetic system-sleep fixture in disposable Linux
-containers. `verify_windows.py` checks native file evidence, version resources,
-and process/DLL discovery using the current Python interpreter as a synthetic
-fixture. These checks and key-authenticated Windows SSH transport passed on a
-live Windows host; loaded-image uncertainty and protected-process coverage errors
-remain explicit. Linux SSH/sudo policy and production PHP deployments remain
-untested.
+The regression suite covers verdicts, discovery, runtime identity, package evidence,
+version handling, HTTP checks, and remote failures. `verify_native.py` checks
+package digests, version comparison and procfs identity/replacement in disposable
+Linux containers, using a copy of `sleep` as a test process. `verify_windows.py`
+checks file evidence, version resources and process/DLL discovery using the current
+Python interpreter and DLL. Neither test script runs PHP. Results and untested
+platforms are listed under [Tested environments](#tested-environments).
 
 This is a point-in-time patch audit, not an exploitation or compromise test.
 Package databases, system tools, kernel/procfs, and supplied inventory/evidence
@@ -309,19 +442,7 @@ appropriate read access and recheck. Large process fleets may exceed the 120-sec
 SSH audit timeout and require separate runs within smaller deployment namespaces.
 No service restart or remediation happens automatically.
 
-HTTP uses certificate validation and does not follow redirects. A proxy/WAF
-response, rejected request, or missing header remains only
-an observation. It cannot certify any backend.
+HTTP uses certificate validation and does not follow redirects. HTTP responses,
+including proxy/WAF responses, cannot establish the backend's patch status.
 URLs and target lists are trusted operator input; requests may reach loopback,
 private, and link-local destinations.
-
-Sources:
-
-- https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
-- https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp
-- https://ubuntu.com/security/CVE-2026-109618
-- https://ubuntu.com/security/CVE-2026-109619
-- https://security-tracker.debian.org/tracker/CVE-2026-109618
-- https://security-tracker.debian.org/tracker/CVE-2026-109619
-- https://access.redhat.com/errata/RHSA-2026:87080
-- https://access.redhat.com/errata/RHSA-2026:87151
