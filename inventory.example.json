@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "scope": "REPLACE: hostname and deployment/namespace covered by this inventory",
+  "coverage_confirmed": false,
+  "runtimes": [
+    {
+      "label": "REPLACE: application or PHP pool",
+      "kind": "fpm",
+      "path": "/usr/sbin/php-fpm8.3"
+    }
+  ]
+}
