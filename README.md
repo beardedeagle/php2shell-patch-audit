@@ -313,6 +313,8 @@ No service restart or remediation happens automatically.
 HTTP uses certificate validation and does not follow redirects. A proxy/WAF
 response, rejected request, or missing header remains only
 an observation. It cannot certify any backend.
+URLs and target lists are trusted operator input; requests may reach loopback,
+private, and link-local destinations.
 
 Sources:
 

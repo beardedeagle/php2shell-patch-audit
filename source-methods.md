@@ -76,7 +76,7 @@ The ordinary regression suite uses synthetic evidence and loopback HTTP fixtures
 python3 -m unittest discover -q
 ```
 
-It covers 75 tests, including package adapters, advisory scope, separate fixes for
+It covers 77 tests, including package adapters, advisory scope, separate fixes for
 the two CVEs, unsupported RPM module metadata, malformed compressed input,
 Windows paths, file-versus-process verdicts, HTTP/multipart controls, log/event
 limits, and serialized transport results. No external HTTP target was probed.

@@ -65,15 +65,31 @@ class DistributionTests(unittest.TestCase):
     def test_alpine_checksum_is_file_specific(self):
         checksum = "Q1" + base64.b64encode(bytes.fromhex("ab" * 20)).decode()
         database = f"P:php83\nV:8.3.36-r0\nF:usr/bin\nR:php83-other\nZ:{checksum}\nR:php83\nZ:{checksum}\n"
-        with patch.object(Path, "read_text", return_value=database):
+        with patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.StringIO(database)):
             result = audit.apk_metadata("/usr/bin/php83")
             self.assertEqual(result["digest"], "ab" * 20)
             self.assertEqual(result["version"], "8.3.36-r0")
             with self.assertRaises(audit.AuditError):
                 audit.apk_metadata("/usr/bin/php8")
-        with patch.object(Path, "read_text", return_value=database.replace("Q1", "Q9")):
+        with patch.object(Path, "open", return_value=io.StringIO(database.replace("Q1", "Q9"))):
             with self.assertRaises(audit.AuditError):
                 audit.apk_metadata("/usr/bin/php83")
+
+    def test_alpine_stream_preserves_boundaries_and_rejects_duplicate_owners(self):
+        checksum = "Q1" + base64.b64encode(bytes.fromhex("ab" * 20)).decode()
+        record = f"P:php83\nV:8.3.36-r0\nF:usr/bin\nR:php83\nZ:{checksum}"
+        cases = ((record, None),
+                 (record + "\n\n" + record.replace("P:php83", "P:other"), "No unique APK"),
+                 (record + f"\n\nF:usr/bin\nR:php83\nZ:{checksum}", "Invalid APK"))
+        for database, error in cases:
+            with self.subTest(error=error), io.StringIO(database) as stream, \
+                    patch.object(Path, "open", return_value=stream), \
+                    patch.object(stream, "read", side_effect=AssertionError("Database must be streamed")):
+                if error:
+                    with self.assertRaisesRegex(audit.AuditError, error):
+                        audit.apk_metadata("/usr/bin/php83")
+                else:
+                    self.assertEqual(audit.apk_metadata("/usr/bin/php83")["package"], "php83")
 
     def test_pacman_uses_owned_package_mtree_digest(self):
         replies = [subprocess.CompletedProcess([], 0, "php\n", ""),
@@ -114,6 +130,20 @@ class DistributionTests(unittest.TestCase):
 
 
 class FileAndWindowsTests(unittest.TestCase):
+    def test_hash_stream_rejects_mid_read_metadata_changes(self):
+        with tempfile.TemporaryFile() as stream:
+            stream.write(b"test runtime")
+            stream.flush()
+            info = audit.os.fstat(stream.fileno())
+            fields = {key: getattr(info, key) for key in ("st_size", "st_mtime_ns", "st_ctime_ns")}
+            for key in fields:
+                stream.seek(0)
+                changed = SimpleNamespace(**dict(fields, **{key: fields[key] + 1}))
+                with self.subTest(field=key), \
+                        patch.object(audit.os, "fstat", side_effect=[info, changed]), \
+                        self.assertRaisesRegex(audit.AuditError, "File changed while hashing"):
+                    audit.hash_stream(stream)
+
     def test_file_hash_uses_consistent_handle_metadata_but_rejects_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "php"

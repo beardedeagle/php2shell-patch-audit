@@ -594,9 +594,13 @@ def rpm_metadata(path):
 
 def apk_metadata(path):
     matches = []
-    for block in Path("/lib/apk/db/installed").read_text().split("\n\n"):
+    with Path("/lib/apk/db/installed").open() as stream:
         name = version = directory = filename = None
-        for line in block.splitlines():
+        for line in stream:
+            line = line.rstrip("\r\n")
+            if not line:
+                name = version = directory = filename = None
+                continue
             key, sep, value = line.partition(":")
             if not sep:
                 continue
